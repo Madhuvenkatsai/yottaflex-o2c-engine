@@ -22,14 +22,15 @@ class KnownFaultInjector:
 
     def apply(self, records: dict[str, list[dict]]) -> list[dict]:
         ledger: list[dict] = []
-        ledger.append(self._invoice_beyond_shipped(records))
+        ledger.append(self._invoice_beyond_shipped(records, records["invoice_lines"]))
         ledger.append(self._double_allocate_payment(records))
         ledger.append(self._close_order_while_open_ar(records))
         ledger.append(self._skip_order_state(records))
         ledger.append(self._dispute_outside_ar(records))
         return ledger
 
-    def _invoice_beyond_shipped(self, records: dict[str, list[dict]]) -> dict:
+    def _invoice_beyond_shipped(
+    self, records: dict[str, list[dict]], invoice_lines: list[dict]) -> dict:
         invoices = records["invoices"]
         shipped_by_order: dict[str, int] = {}
         for shipment in records["shipments"]:
@@ -47,12 +48,26 @@ class KnownFaultInjector:
         fulfilled = shipped_by_order[target["sales_order_id"]]
         inflated = fulfilled + 87_500_00
         delta = inflated - target["_amount_cents"]
+        old_total = target["_total_cents"]
         target["_amount_cents"] = inflated
-        target["_total_cents"] += delta
-        target["_balance_cents"] += delta
+
+        tax = 0 if target["_order_ref"]["_account"]["region"].startswith("NA") else int(round(inflated * 0.08))
+        target["_tax_cents"] = tax
+        target["_total_cents"] = inflated + tax
+        target["_balance_cents"] += target["_total_cents"] - old_total
+
         target["invoice_amount"] = format_cents(target["_amount_cents"])
+        target["tax_amount"] = format_cents(target["_tax_cents"])
         target["total_due"] = format_cents(target["_total_cents"])
         target["balance_due"] = format_cents(max(target["_balance_cents"], 0))
+
+        if target["_balance_cents"] > 0:
+           target["invoice_status"] = "partial"
+
+        for line in invoice_lines:
+            if line["invoice_id"] == target["invoice_id"]:
+               line["line_amount"] = target["invoice_amount"]
+               break
         return {
             "anomaly_code": ANOMALY_INVOICE_EXCEEDS_FULFILLMENT,
             "severity": "high",
