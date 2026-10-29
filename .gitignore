@@ -10,7 +10,6 @@ build/
 output/
 *.log
 .DS_Store
-.env
 
 # Temporary files
 check_exports.py
@@ -19,3 +18,5 @@ src/o2c_sim/*.backup*
 output/
 __pycache__/
 .pytest_cache/
+config.bat
+node_modules

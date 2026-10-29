@@ -1,47 +1,14 @@
-# Order-to-Cash Synthetic Data Generator
+# YottaFlex Order-to-Cash Engine
 
-## Project Overview
+This Python package deterministically generates synthetic Order-to-Cash (O2C) ledger data for development, testing, and evaluation. It models accounts, quotes, sales orders, fulfillment, invoices, payments, disputes, and status events. All business records are synthetic.
 
-This project generates synthetic data for an Order-to-Cash (O2C) business workflow. It models the movement of transactions from account creation and quotations through sales orders, shipments, invoicing, payments, and disputes.
+## Requirements and installation
 
-The generator creates linked datasets with consistent identifiers, transaction relationships, status histories, and validation outputs. A fixed random seed is used to support reproducible generation.
+- Python 3.11 or later
+- NumPy and pandas
+- pytest for development and tests
 
-## Technology Stack
-
-- Python 3.11+
-- pandas
-- NumPy
-- pytest
-
-## Project Structure
-
-```text
-YOTTAFLEX (CHALLANGE)/
-├── src/
-│   └── o2c_sim/
-│       ├── checksums.py
-│       ├── cli.py
-│       ├── cycle_builder.py
-│       ├── entropy.py
-│       ├── fault_injection.py
-│       ├── identity.py
-│       ├── ledger.py
-│       ├── money.py
-│       ├── orchestration.py
-│       ├── settings.py
-│       └── verification.py
-├── tests/
-│   ├── test_cycle_replay.py
-│   └── test_identity.py
-├── output/
-│   └── ledger/
-├── pyproject.toml
-└── README.md
-```
-
-## Setup
-
-Create and activate a virtual environment if one is not already available.
+Create a virtual environment and install the project with its test dependency:
 
 ```powershell
 python -m venv .venv
@@ -49,29 +16,49 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
-## Run the Generator
+Alternatively, install runtime and test dependencies from `requirements.txt`:
 
-Generate the datasets using the configured seed:
+```powershell
+pip install -r requirements.txt
+```
+
+## Generate a ledger
+
+From the repository root, run:
 
 ```powershell
 python -m o2c_sim
 ```
 
-The current generation seed is `20261022`.
-
-## Run Tests
-
-Execute the automated test suite:
+The default output directory is `output/ledger/`. Pass a directory as the first argument to choose another destination:
 
 ```powershell
-python -m pytest -v
+python -m o2c_sim output/ledger-run
 ```
 
-The current test suite contains checks for generation replay and zero-padded document identifiers.
+The fixed challenge seed is `20261022`. The installed console entry point is also available:
 
-## Generated Dataset
+```powershell
+assemble-o2c-ledger output/ledger-run
+```
 
-The latest successful generation reported the following record counts.
+The CLI prints a row census and verification result. It exits with status `0` when the report passes and `2` when one or more checks fail.
+
+## Generated files
+
+The output directory contains one CSV for each table described in [DATA_DICTIONARY.md](DATA_DICTIONARY.md), plus:
+
+- `verification_report.csv`: check name, pass indicator, and observed/expected evidence.
+- `checksum_manifest.csv`: CSV table row counts and SHA-256 digests of canonical table contents.
+- `o2c_ledger.sqlite`: SQLite tables with primary keys and supported foreign keys.
+- `o2c_ledger.sql`: SQL dump of the SQLite database.
+- `json/<table>.json`: newline-delimited JSON (one JSON object per row).
+
+SQLite stores exported values as text to preserve the CSV representation. Blank optional values are stored as SQL `NULL`. The deliberately phantom dispute reference has no SQLite foreign-key constraint; the verifier detects and evaluates it as an injected anomaly.
+
+## Dataset volumes
+
+The fixed-seed generator produces the following record counts:
 
 | Dataset | Records |
 |---|---:|
@@ -89,71 +76,49 @@ The latest successful generation reported the following record counts.
 | Status events | 15,000 |
 | Ground-truth entries | 5 |
 
-## Output Location
+The generator requires enough shipment-backed orders to produce the configured invoice target using no more than two invoices per shipped order. Orders without shipments are not invoiced. If the target cannot be achieved, generation raises an error rather than emitting unsupported invoices. The configured payment target is 6,934; eligible settlements are selected reproducibly to maintain this published dataset volume. Payment and dispute generation fail explicitly if their targets cannot be met from eligible records. In ordinary generated records, an order is closed only after fulfillment and settlement of all its invoices; the injected closed-with-unpaid scenario is the single exception.
 
-Generated CSV files and validation artifacts are stored in:
+## Architecture
 
-```text
-output/ledger/
+- `src/o2c_sim/entropy.py` provides a single seeded random stream; `identity.py` creates deterministic document IDs.
+- `cycle_builder.py` constructs the linked operational records, closes eligible settled orders, and builds the sampled status timeline.
+- `fault_injection.py` injects the five documented scenarios and creates the separate ground-truth table.
+- `ledger.py` stores tables and writes CSV files.
+- `verification.py` checks volumes, keys and relationships, state values and transitions, chronology, financial reconciliation, anomaly detection, and label isolation.
+- `orchestration.py` assembles, verifies, and exports CSV, JSONL, SQLite, and SQL.
+- `cli.py` exposes the command-line entry point.
+
+## Validation and intentional anomalies
+
+The verification report contains independent checks for configured and derived volumes, primary-key uniqueness, ID and money formats, foreign keys, entity relationships, allowed states, event transitions, and chronology. Financial checks validate line extensions, invoice line totals, tax and total calculations, invoice balances against allocations, payment totals against allocated and unapplied amounts, and allocation limits.
+
+The generator intentionally injects exactly one scenario of each type:
+
+- `invoice_exceeds_fulfillment`: one invoice is inflated above its order's delivered fulfillment.
+- `payment_allocated_twice`: a payment is allocated to a second invoice, exceeding the payment amount.
+- `order_closed_with_unpaid_invoice`: an order is closed while a related invoice remains unpaid.
+- `status_event_skips_state`: a sales-order event jumps from `booked` to `closed`.
+- `dispute_not_in_receivables`: one dispute references an invoice ID absent from the invoice table.
+
+Anomaly detectors inspect operational tables only. A separate evaluation step compares each detector's observed IDs with `ground_truth.csv`; labels are not used to find anomalies or as operational features. Intentional anomalies are visible in the report, and unexpected additional findings fail evaluation or their corresponding integrity checks.
+
+The status event table is a sampled timeline with configured quotas, not a complete event history for every entity. It is suitable for the documented state-transition and per-entity timestamp checks, but should not be treated as a full audit log.
+
+## Tests and reproducibility
+
+Run the complete test suite:
+
+```powershell
+python -m pytest -v
 ```
 
-The output includes the entity datasets, ground-truth records, checksum manifest, and verification report.
+Tests cover deterministic CSV/checksum replay, configured record counts, the five independently detected anomalies, label isolation, integrity and chronology failures, financial reconciliation, insufficient dispute candidates, export contents, and CLI exit behavior.
 
-## Validation and Reproducibility
+To check a fresh generation manually, generate twice into separate empty directories and compare the table CSVs and `checksum_manifest.csv`. Identical seeds and dependency behavior should produce identical outputs.
 
-The latest run completed with `verification_failed=0`. The automated test suite also completed with two passing tests.
+## Known limitations
 
-The project uses a fixed seed and includes checksum and replay functionality. These features support repeatable generation and comparison of generated datasets.
-
-## Data Provenance
-
-All business records are synthetically generated for software development, testing, and evaluation. They are not intended to represent real customer or financial transactions.
-## Business Rules and Exception Handling
-
-The generator models the Order-to-Cash lifecycle:
-Account -> Quote -> Sales Order -> Shipment -> Invoice -> Payment Allocation.
-
-It also records disputes and lifecycle status events. Derived financial values and balances should be calculated from their source records and reconciled by the validation process.
-
-### Required Anomaly Scenarios
-
-The separate ground-truth dataset identifies the following deliberately injected scenarios:
-
-- `dispute_not_in_receivables`: A dispute is not reflected in receivables.
-- `invoice_exceeds_fulfillment`: An invoice exceeds the supported fulfilled value.
-- `order_closed_with_unpaid_invoice`: An order is closed while an invoice remains unpaid.
-- `payment_allocated_twice`: A payment allocation anomaly is injected.
-- `status_event_skips_state`: A status event skips a required lifecycle state.
-
-Ground-truth labels are evaluation references and must not be used as ordinary input features for anomaly detection.
-
-### Validation Expectations
-
-Validation should cover:
-
-- Primary-key uniqueness and valid entity relationships.
-- Allowed lifecycle states and legal state transitions.
-- Date ordering and deterministic identifier generation.
-- Monetary calculations, invoice balances, and payment allocations.
-- Traceability of exceptions to their affected entities.
-- Fixed-seed regeneration and output checksum comparison.
-
-Any deliberate anomaly must be documented and distinguishable from an unintended generator or data-integrity defect.
-
-### Reproducibility Procedure
-
-Run the generator twice with the configured seed, compare the record counts and checksum manifest, and investigate any unexpected differences.
-
-### Business Evaluation Metrics
-
-Useful operational metrics include:
-
-- Value of fulfilled goods not yet invoiced.
-- Potential over-invoicing exposure.
-- Outstanding overdue receivables.
-- Short-paid and over-allocated payments.
-- Disputed balances and their receivables treatment.
-- Exception counts and the source records supporting each finding.
-
-These metrics should be calculated from transaction data using a documented reporting cutoff date.
-
+- The model is synthetic and uses a simplified tax rule: 0% for `NA-*` regions and 8% elsewhere.
+- The default challenge seed and configuration define the published fixed-seed record counts; stochastic table counts can vary with a different seed.
+- The SQLite and SQL exports represent money and timestamps as text, matching the CSV values; consumers should parse them using the data types documented for their use.
+- The generated data is not a substitute for accounting, tax, or production-system validation.

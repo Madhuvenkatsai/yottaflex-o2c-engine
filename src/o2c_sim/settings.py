@@ -13,6 +13,7 @@ class VolumePlan:
     quotes: int = 10_000
     sales_orders: int = 7_000
     invoices: int = 8_000
+    payments: int = 6_934
     timeline_events: int = 15_000
     disputes: int = 420
 

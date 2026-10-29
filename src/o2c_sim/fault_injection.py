@@ -22,32 +22,49 @@ class KnownFaultInjector:
 
     def apply(self, records: dict[str, list[dict]]) -> list[dict]:
         ledger: list[dict] = []
-        ledger.append(self._invoice_beyond_shipped(records, records["invoice_lines"]))
+        invoice_fault = self._invoice_beyond_shipped(
+            records, records["invoice_lines"]
+        )
+        ledger.append(invoice_fault)
         ledger.append(self._double_allocate_payment(records))
-        ledger.append(self._close_order_while_open_ar(records))
-        ledger.append(self._skip_order_state(records))
+        closed_order_fault = self._close_order_while_open_ar(
+            records, {invoice_fault["related_ids"]}
+        )
+        ledger.append(closed_order_fault)
+        ledger.append(
+            self._skip_order_state(
+                records,
+                {invoice_fault["related_ids"], closed_order_fault["anchor_id"]},
+            )
+        )
         ledger.append(self._dispute_outside_ar(records))
         return ledger
 
     def _invoice_beyond_shipped(
-    self, records: dict[str, list[dict]], invoice_lines: list[dict]) -> dict:
+        self, records: dict[str, list[dict]], invoice_lines: list[dict]
+    ) -> dict:
         invoices = records["invoices"]
         shipped_by_order: dict[str, int] = {}
         for shipment in records["shipments"]:
-            shipped_by_order[shipment["sales_order_id"]] = shipped_by_order.get(shipment["sales_order_id"], 0) + shipment[
-                "_fulfilled_cents"
-            ]
+            shipped_by_order[shipment["sales_order_id"]] = (
+                shipped_by_order.get(shipment["sales_order_id"], 0)
+                + shipment["_fulfilled_cents"]
+            )
         target = None
         for invoice in invoices:
             fulfilled = shipped_by_order.get(invoice["sales_order_id"], 0)
-            if fulfilled > 0 and invoice["_amount_cents"] <= fulfilled and invoice["invoice_status"] != "disputed":
+            if (
+                fulfilled > 0
+                and invoice["_amount_cents"] <= fulfilled
+                and invoice["invoice_status"] != "disputed"
+                and invoice["_order_ref"]["order_status"] != "closed"
+            ):
                 target = invoice
                 break
         if target is None:
             raise RuntimeError("no invoice available for fulfillment overrun")
         fulfilled = shipped_by_order[target["sales_order_id"]]
         inflated = fulfilled + 87_500_00
-        delta = inflated - target["_amount_cents"]
         old_total = target["_total_cents"]
         target["_amount_cents"] = inflated
 
@@ -62,12 +79,12 @@ class KnownFaultInjector:
         target["balance_due"] = format_cents(max(target["_balance_cents"], 0))
 
         if target["_balance_cents"] > 0:
-           target["invoice_status"] = "partial"
+            target["invoice_status"] = "partial"
 
         for line in invoice_lines:
             if line["invoice_id"] == target["invoice_id"]:
-               line["line_amount"] = target["invoice_amount"]
-               break
+                line["line_amount"] = target["invoice_amount"]
+                break
         return {
             "anomaly_code": ANOMALY_INVOICE_EXCEEDS_FULFILLMENT,
             "severity": "high",
@@ -88,13 +105,19 @@ class KnownFaultInjector:
                 break
         if source is None:
             raise RuntimeError("no paid allocation available for duplication")
-        twin_invoice = None
-        for invoice in records["invoices"]:
-            if invoice["invoice_id"] != source["invoice_id"] and invoice["account_id"] == invoices[source["invoice_id"]]["account_id"]:
-                twin_invoice = invoice
-                break
+        twin_invoice = next(
+            (
+                invoice
+                for invoice in records["invoices"]
+                if invoice["invoice_id"] != source["invoice_id"]
+                and invoice["account_id"] == invoices[source["invoice_id"]]["account_id"]
+            ),
+            None,
+        )
         if twin_invoice is None:
-            twin_invoice = next(inv for inv in records["invoices"] if inv["invoice_id"] != source["invoice_id"])
+            raise RuntimeError(
+                "no second invoice exists for the payment double-allocation fault"
+            )
         duplicate = {
             "payment_id": source["payment_id"],
             "invoice_id": twin_invoice["invoice_id"],
@@ -112,12 +135,20 @@ class KnownFaultInjector:
             "notes": "single payment_id is applied to two invoice lines for the full amount",
         }
 
-    def _close_order_while_open_ar(self, records: dict[str, list[dict]]) -> dict:
+    def _close_order_while_open_ar(
+        self,
+        records: dict[str, list[dict]],
+        excluded_orders: set[str],
+    ) -> dict:
         by_order = {row["sales_order_id"]: row for row in records["sales_orders"]}
         target_invoice = None
         for invoice in records["invoices"]:
             order = by_order[invoice["sales_order_id"]]
-            if invoice["invoice_status"] in {"open", "partial", "disputed"} and invoice["_balance_cents"] > 0:
+            if (
+                invoice["sales_order_id"] not in excluded_orders
+                and invoice["invoice_status"] in {"open", "partial", "disputed"}
+                and invoice["_balance_cents"] > 0
+            ):
                 target_invoice = invoice
                 break
         if target_invoice is None:
@@ -138,8 +169,20 @@ class KnownFaultInjector:
             "notes": "sales order marked closed while related invoice still carries an unpaid balance",
         }
 
-    def _skip_order_state(self, records: dict[str, list[dict]]) -> dict:
-        event = next(row for row in records["status_events"] if row["entity_type"] == "sales_order")
+    def _skip_order_state(
+        self, records: dict[str, list[dict]], excluded_orders: set[str]
+    ) -> dict:
+        event = next(
+            (
+                row
+                for row in records["status_events"]
+                if row["entity_type"] == "sales_order"
+                and row["entity_id"] not in excluded_orders
+            ),
+            None,
+        )
+        if event is None:
+            raise RuntimeError("no independent sales-order event is available for the skipped-state fault")
         event["from_status"] = "booked"
         event["to_status"] = "closed"
         return {

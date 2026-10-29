@@ -106,6 +106,7 @@ class CausalCycleAssembler:
             })
 
         payments, allocations = self._build_settlements(invoices)
+        self._close_settled_orders(sales_orders, invoices, payments, allocations)
         disputes = self._build_disputes(invoices)
 
         status_events = self._compose_timeline(
@@ -261,13 +262,6 @@ class CausalCycleAssembler:
             else:
                 order["order_status"] = "in_fulfillment"
         still_open = [o for o in sales_orders if o["order_status"] == "booked"]
-        closable = [o for o in sales_orders if o["order_status"] == "fulfilled"]
-        for order in closable:
-            if self.entropy.chance(0.82):
-                closed = _clip_later(self.entropy, order["_booked_at"] + timedelta(days=3), 24, 24 * 25)
-                order["order_status"] = "closed"
-                order["closed_at"] = _iso(closed)
-                order["_closed_at"] = closed
         for order in still_open:
             order["_fulfilled_cents"] = 0
         return rows
@@ -278,33 +272,39 @@ class CausalCycleAssembler:
             by_order.setdefault(shipment["sales_order_id"], []).append(shipment)
 
         billed: list[dict] = []
-        extra_needed = VOLUME_PLAN.invoices - len(sales_orders)
         shipped_order_ids = [sid for sid in by_order.keys()]
-        split_ids = set(shipped_order_ids[: max(extra_needed, 0)])
+        split_count = VOLUME_PLAN.invoices - len(shipped_order_ids)
+        if split_count < 0 or split_count > len(shipped_order_ids):
+            raise RuntimeError(
+                "invoice target cannot be met with at most two invoices per "
+                f"shipped order: target={VOLUME_PLAN.invoices} "
+                f"shipped_orders={len(shipped_order_ids)}"
+            )
+        split_ids = set(shipped_order_ids[:split_count])
 
         for order in sales_orders:
             legs = by_order.get(order["sales_order_id"], [])
             if not legs:
-                issued = _clip_later(self.entropy, order["_booked_at"], 24, 120)
-                amount = order["_amount_cents"]
-                billed.append(self._invoice_row(order, None, amount, issued, "open"))
                 continue
 
-            if order["sales_order_id"] in split_ids and len(legs) >= 1:
-                first = int(order["_fulfilled_cents"] * 0.45) if order["_fulfilled_cents"] else int(order["_amount_cents"] * 0.45)
-                second = (order["_fulfilled_cents"] or order["_amount_cents"]) - first
+            if order["sales_order_id"] in split_ids:
+                first = int(order["_fulfilled_cents"] * 0.45)
+                second = order["_fulfilled_cents"] - first
                 t1 = _clip_later(self.entropy, legs[0]["_delivered_at"], 2, 48)
                 billed.append(self._invoice_row(order, legs[0], first, t1, "open"))
                 t2 = _clip_later(self.entropy, legs[-1]["_delivered_at"], 6, 72)
                 billed.append(self._invoice_row(order, legs[-1], second, t2, "open"))
             else:
-                amount = order["_fulfilled_cents"] or order["_amount_cents"]
+                amount = order["_fulfilled_cents"]
                 issued = _clip_later(self.entropy, legs[-1]["_delivered_at"], 2, 60)
                 billed.append(self._invoice_row(order, legs[-1], amount, issued, "open"))
 
-        if len(billed) < VOLUME_PLAN.invoices:
-            raise RuntimeError("invoice assembly fell short of volume target")
-        return billed[: VOLUME_PLAN.invoices]
+        if len(billed) != VOLUME_PLAN.invoices:
+            raise RuntimeError(
+                "invoice assembly did not meet volume target: "
+                f"expected={VOLUME_PLAN.invoices} actual={len(billed)}"
+            )
+        return billed
 
     def _invoice_row(self, order: dict, shipment: dict | None, amount: int, issued: datetime, status: str) -> dict:
         tax = 0 if order["_account"]["region"].startswith("NA") else int(round(amount * 0.08))
@@ -334,10 +334,26 @@ class CausalCycleAssembler:
     def _build_settlements(self, invoices: list[dict]) -> tuple[list[dict], list[dict]]:
         payments: list[dict] = []
         allocations: list[dict] = []
+        eligible = []
         for invoice in invoices:
             if invoice["_order_ref"]["order_status"] == "booked" and self.entropy.chance(0.7):
                 continue
             if self.entropy.chance(0.11):
+                continue
+            eligible.append(invoice)
+
+        if len(eligible) < VOLUME_PLAN.payments:
+            raise RuntimeError(
+                "insufficient eligible invoices for payment target: "
+                f"expected={VOLUME_PLAN.payments} eligible={len(eligible)}"
+            )
+        excess = len(eligible) - VOLUME_PLAN.payments
+        skipped = set()
+        while len(skipped) < excess:
+            skipped.add(int(self.entropy.integers(0, len(eligible))))
+
+        for index, invoice in enumerate(eligible):
+            if index in skipped:
                 continue
             posted = _clip_later(self.entropy, invoice["_issued_at"], 24, 24 * 28)
             if self.entropy.chance(0.16):
@@ -373,11 +389,64 @@ class CausalCycleAssembler:
             )
         return payments, allocations
 
+    def _close_settled_orders(
+        self,
+        sales_orders: list[dict],
+        invoices: list[dict],
+        payments: list[dict],
+        allocations: list[dict],
+    ) -> None:
+        invoices_by_order: dict[str, list[dict]] = {}
+        for invoice in invoices:
+            invoices_by_order.setdefault(invoice["sales_order_id"], []).append(invoice)
+
+        payment_times = {
+            payment["payment_id"]: payment["_posted_at"]
+            for payment in payments
+        }
+        settlement_times: dict[str, list[datetime]] = {}
+        for allocation in allocations:
+            settlement_times.setdefault(allocation["invoice_id"], []).append(
+                payment_times[allocation["payment_id"]]
+            )
+
+        for order in sales_orders:
+            if order["order_status"] != "fulfilled":
+                continue
+            order_invoices = invoices_by_order.get(order["sales_order_id"], [])
+            if not order_invoices or any(
+                invoice["_balance_cents"] > 0 for invoice in order_invoices
+            ):
+                continue
+            if not self.entropy.chance(0.82):
+                continue
+
+            last_payment = max(
+                (
+                    posted
+                    for invoice in order_invoices
+                    for posted in settlement_times.get(invoice["invoice_id"], [])
+                ),
+                default=order["_booked_at"],
+            )
+            close_origin = max(
+                last_payment,
+                order["_booked_at"] + timedelta(days=3),
+            )
+            closed = _clip_later(self.entropy, close_origin, 24, 24 * 25)
+            order["order_status"] = "closed"
+            order["closed_at"] = _iso(closed)
+            order["_closed_at"] = closed
+
     def _build_disputes(self, invoices: list[dict]) -> list[dict]:
         candidates = [inv for inv in invoices if inv["invoice_status"] in {"open", "partial"}]
+        if len(candidates) < VOLUME_PLAN.disputes:
+            raise RuntimeError(
+                "insufficient eligible invoices for dispute target: "
+                f"expected={VOLUME_PLAN.disputes} eligible={len(candidates)}"
+            )
         rows: list[dict] = []
-        target = min(VOLUME_PLAN.disputes, len(candidates))
-        for invoice in candidates[:target]:
+        for invoice in candidates[:VOLUME_PLAN.disputes]:
             opened = _clip_later(self.entropy, invoice["_issued_at"], 12, 24 * 18)
             claimed = min(invoice["_balance_cents"], max(5_000, int(invoice["_total_cents"] * 0.2)))
             invoice["invoice_status"] = "disputed"

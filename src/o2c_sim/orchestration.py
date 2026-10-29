@@ -138,9 +138,15 @@ class O2CPipelineSimulator:
 
         # Run data-quality verification.
         expected = {
+            "accounts": VOLUME_PLAN.accounts,
             "quotes": VOLUME_PLAN.quotes,
+            "quote_lines": VOLUME_PLAN.quotes,
             "sales_orders": VOLUME_PLAN.sales_orders,
+            "order_lines": VOLUME_PLAN.sales_orders,
             "invoices": VOLUME_PLAN.invoices,
+            "invoice_lines": VOLUME_PLAN.invoices,
+            "payments": VOLUME_PLAN.payments,
+            "disputes": VOLUME_PLAN.disputes,
             "status_events": VOLUME_PLAN.timeline_events,
             "ground_truth": 5,
         }
