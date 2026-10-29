@@ -94,6 +94,7 @@ class LedgerAuditor:
         self._check_foreign_keys(report)
         self._check_chronology(report)
         self._check_balances(report)
+        self._check_required_anomalies(report)
         self._check_ground_truth_isolation(report)
         return report
 
@@ -248,6 +249,67 @@ class LedgerAuditor:
         pay_join = payments.set_index("payment_id")["_amt"].subtract(applied_pmt).fillna(0)
         over_applied = int((pay_join < 0).sum())
         report.add("anomaly:expected_payment_over_allocation", over_applied == 1, f"expected=1 observed={over_applied}")
+
+    def _check_required_anomalies(self, report: VerificationReport) -> None:
+        invoices = self.tables["invoices"].copy()
+        orders = self.tables["sales_orders"].copy()
+        invoices["_balance_cents"] = invoices["balance_due"].map(cents_from_text)
+
+        merged = invoices.merge(
+            orders[["sales_order_id", "order_status"]],
+            on="sales_order_id",
+            how="inner",
+        )
+        closed_unpaid = merged[
+            (merged["order_status"] == "closed")
+            & (merged["_balance_cents"] > 0)
+        ]
+        closed_unpaid_orders = set(closed_unpaid["sales_order_id"])
+        unpaid_order_count = len(closed_unpaid_orders)
+
+        report.add(
+            "anomaly:expected_order_closed_with_unpaid_invoice",
+            unpaid_order_count >= 1,
+            f"closed_orders_with_unpaid_invoices={unpaid_order_count}",
+        )
+
+        events = self.tables["status_events"]
+        order_events = events[events["entity_type"] == "sales_order"]
+        allowed = {
+            ("none", "booked"),
+            ("booked", "in_fulfillment"),
+            ("in_fulfillment", "fulfilled"),
+            ("fulfilled", "closed"),
+        }
+        invalid = order_events[
+            ~order_events.apply(
+                lambda row: (row["from_status"], row["to_status"]) in allowed,
+                axis=1,
+            )
+        ]
+        expected_skip = (
+            (order_events["from_status"] == "booked")
+            & (order_events["to_status"] == "closed")
+        )
+        unexpected_invalid = invalid.loc[~expected_skip.loc[invalid.index]]
+        expected_skips = int(expected_skip.sum())
+        unexpected_count = len(unexpected_invalid)
+
+        report.add(
+            "anomaly:expected_status_event_skips_state",
+            expected_skips == 1 and unexpected_count == 0,
+            f"expected_skipped_transitions=1 observed={expected_skips} "
+            f"unexpected_invalid_transitions={unexpected_count}",
+        )
+
+        disputes = self.tables["disputes"]
+        invoice_ids = set(invoices["invoice_id"])
+        missing = disputes[~disputes["invoice_id"].isin(invoice_ids)]
+        report.add(
+            "business:dispute_invoice_exists",
+            len(missing) == 1,
+            f"missing_invoice_disputes={len(missing)}",
+        )
 
     def _check_ground_truth_isolation(self, report: VerificationReport) -> None:
         truth = self.tables["ground_truth"]
