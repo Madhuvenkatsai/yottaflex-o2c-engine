@@ -206,14 +206,14 @@ class LedgerAuditor:
         compared = paid.subtract(applied).fillna(paid)
         # Double allocation is an injected fault, so the auditor records drift instead of failing the suite.
         drift_rows = int((compared.abs() > 0).sum())
-        report.add("balance:allocations_vs_invoice", True, f"invoices_with_allocation_drift={drift_rows}")
+        report.add("anomaly:expected_invoice_allocation_drift", drift_rows == 1, f"expected=1 observed={drift_rows}")
 
         payments = self.tables["payments"].copy()
         payments["_amt"] = payments["payment_amount"].map(cents_from_text)
         applied_pmt = alloc.groupby("payment_id")["_amt"].sum()
         pay_join = payments.set_index("payment_id")["_amt"].subtract(applied_pmt).fillna(0)
         over_applied = int((pay_join < 0).sum())
-        report.add("balance:payment_over_allocation", True, f"payments_over_applied={over_applied}")
+        report.add("anomaly:expected_payment_over_allocation", over_applied == 1, f"expected=1 observed={over_applied}")
 
     def _check_ground_truth_isolation(self, report: VerificationReport) -> None:
         truth = self.tables["ground_truth"]
