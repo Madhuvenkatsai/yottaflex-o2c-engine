@@ -108,3 +108,52 @@ The project uses a fixed seed and includes checksum and replay functionality. Th
 ## Data Provenance
 
 All business records are synthetically generated for software development, testing, and evaluation. They are not intended to represent real customer or financial transactions.
+## Business Rules and Exception Handling
+
+The generator models the Order-to-Cash lifecycle:
+Account -> Quote -> Sales Order -> Shipment -> Invoice -> Payment Allocation.
+
+It also records disputes and lifecycle status events. Derived financial values and balances should be calculated from their source records and reconciled by the validation process.
+
+### Required Anomaly Scenarios
+
+The separate ground-truth dataset identifies the following deliberately injected scenarios:
+
+- `dispute_not_in_receivables`: A dispute is not reflected in receivables.
+- `invoice_exceeds_fulfillment`: An invoice exceeds the supported fulfilled value.
+- `order_closed_with_unpaid_invoice`: An order is closed while an invoice remains unpaid.
+- `payment_allocated_twice`: A payment allocation anomaly is injected.
+- `status_event_skips_state`: A status event skips a required lifecycle state.
+
+Ground-truth labels are evaluation references and must not be used as ordinary input features for anomaly detection.
+
+### Validation Expectations
+
+Validation should cover:
+
+- Primary-key uniqueness and valid entity relationships.
+- Allowed lifecycle states and legal state transitions.
+- Date ordering and deterministic identifier generation.
+- Monetary calculations, invoice balances, and payment allocations.
+- Traceability of exceptions to their affected entities.
+- Fixed-seed regeneration and output checksum comparison.
+
+Any deliberate anomaly must be documented and distinguishable from an unintended generator or data-integrity defect.
+
+### Reproducibility Procedure
+
+Run the generator twice with the configured seed, compare the record counts and checksum manifest, and investigate any unexpected differences.
+
+### Business Evaluation Metrics
+
+Useful operational metrics include:
+
+- Value of fulfilled goods not yet invoiced.
+- Potential over-invoicing exposure.
+- Outstanding overdue receivables.
+- Short-paid and over-allocated payments.
+- Disputed balances and their receivables treatment.
+- Exception counts and the source records supporting each finding.
+
+These metrics should be calculated from transaction data using a documented reporting cutoff date.
+
