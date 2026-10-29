@@ -1,17 +1,31 @@
+import argparse
 from pathlib import Path
-import sys
 
 from o2c_sim.orchestration import O2CPipelineSimulator
 from o2c_sim.settings import CHALLENGE_SEED
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = argv if argv is not None else sys.argv[1:]
-    target = Path(args[0]) if args else Path("output") / "ledger"
-    simulator = O2CPipelineSimulator(seed=CHALLENGE_SEED)
+    parser = argparse.ArgumentParser(description="Generate a synthetic O2C ledger.")
+    parser.add_argument(
+        "output_dir",
+        nargs="?",
+        default=str(Path("output") / "ledger"),
+        help="destination directory (default: output/ledger)",
+    )
+    parser.add_argument(
+        "--scale",
+        choices=("starter", "full"),
+        default="full",
+        help="dataset size (default: full)",
+    )
+    args = parser.parse_args(argv)
+    target = Path(args.output_dir)
+    simulator = O2CPipelineSimulator(seed=CHALLENGE_SEED, scale=args.scale)
     simulator.run(target)
     census = simulator.ledger.row_census()
     print(f"seed={CHALLENGE_SEED}")
+    print(f"scale={args.scale}")
     for name, count in census.items():
         print(f"{name}={count}")
     if simulator.last_report is not None:

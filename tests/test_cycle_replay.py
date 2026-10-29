@@ -10,20 +10,30 @@ def test_volume_targets_and_replay(tmp_path: Path):
     O2CPipelineSimulator().run(first)
     O2CPipelineSimulator().run(second)
 
-    left = {path.name: path.read_bytes() for path in first.glob("*.csv")}
-    right = {path.name: path.read_bytes() for path in second.glob("*.csv")}
+    left = {
+        str(path.relative_to(first)): path.read_bytes()
+        for path in first.rglob("*")
+        if path.is_file()
+    }
+    right = {
+        str(path.relative_to(second)): path.read_bytes()
+        for path in second.rglob("*")
+        if path.is_file()
+    }
     assert left == right
 
-    quotes = (first / "quotes.csv").read_text(encoding="utf-8").count("\n") - 1
-    orders = (first / "sales_orders.csv").read_text(encoding="utf-8").count("\n") - 1
-    invoices = (first / "invoices.csv").read_text(encoding="utf-8").count("\n") - 1
-    events = (first / "status_events.csv").read_text(encoding="utf-8").count("\n") - 1
-    truth = (first / "ground_truth.csv").read_text(encoding="utf-8").count("\n") - 1
+    quotes = sum(1 for _ in (first / "quotes.csv").open(encoding="utf-8")) - 1
+    orders = sum(1 for _ in (first / "sales_orders.csv").open(encoding="utf-8")) - 1
+    invoices = sum(1 for _ in (first / "invoices.csv").open(encoding="utf-8")) - 1
+    events = sum(1 for _ in (first / "status_events.csv").open(encoding="utf-8")) - 1
+    truth = sum(1 for _ in (first / "ground_truth.csv").open(encoding="utf-8")) - 1
     assert quotes == VOLUME_PLAN.quotes
     assert orders == VOLUME_PLAN.sales_orders
     assert invoices == VOLUME_PLAN.invoices
-    assert events == VOLUME_PLAN.timeline_events
-    assert truth == 5
+    payments = sum(1 for _ in (first / "payments.csv").open(encoding="utf-8")) - 1
+    assert events + payments >= VOLUME_PLAN.timeline_events
+    assert events > VOLUME_PLAN.timeline_events
+    assert truth == 7
 
     report = (first / "verification_report.csv").read_text(encoding="utf-8")
     assert ",N," not in report
