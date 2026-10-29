@@ -13,9 +13,23 @@ class VolumePlan:
     quotes: int = 10_000
     sales_orders: int = 7_000
     invoices: int = 8_000
+    duplicate_invoice_records: int = 1
     payments: int = 6_934
+    # Minimum combined payment and status-event rows, not an event-row cap.
     timeline_events: int = 15_000
     disputes: int = 420
+
+
+STARTER_VOLUME_PLAN = VolumePlan(
+    accounts=180,
+    quotes=1_000,
+    sales_orders=700,
+    invoices=800,
+    duplicate_invoice_records=1,
+    payments=693,
+    timeline_events=1_500,
+    disputes=42,
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +39,16 @@ class CalendarWindow:
 
 
 VOLUME_PLAN = VolumePlan()
+
+
+def volume_plan_for_scale(scale: str) -> VolumePlan:
+    if scale == "full":
+        return VOLUME_PLAN
+    if scale == "starter":
+        return STARTER_VOLUME_PLAN
+    raise ValueError(f"unsupported dataset scale: {scale}")
+
+
 CALENDAR = CalendarWindow()
 AS_OF_TS = datetime(2026, 10, 22, 18, 0, 0, tzinfo=timezone.utc)
 

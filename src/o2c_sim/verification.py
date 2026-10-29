@@ -4,6 +4,7 @@ import re
 import pandas as pd
 
 from o2c_sim.money import cents_from_text
+from o2c_sim.settings import AS_OF_TS, VOLUME_PLAN, VolumePlan
 
 
 ID_PATTERNS = {
@@ -79,7 +80,7 @@ ALLOWED_STATES = {
 }
 
 ALLOWED_TRANSITIONS = {
-    "account": {("prospect", "active")},
+    "account": {("prospect", "active"), ("prospect", "on_hold")},
     "quote": {
         ("draft", "sent"),
         ("sent", "accepted"),
@@ -92,12 +93,14 @@ ALLOWED_TRANSITIONS = {
         ("in_fulfillment", "fulfilled"),
         ("fulfilled", "closed"),
     },
-    "shipment": {("shipped", "delivered")},
+    "shipment": {("packed", "shipped"), ("shipped", "delivered")},
     "invoice": {
         ("draft", "open"),
-        ("draft", "partial"),
-        ("draft", "paid"),
-        ("draft", "disputed"),
+        ("open", "partial"),
+        ("open", "paid"),
+        ("partial", "paid"),
+        ("open", "disputed"),
+        ("partial", "disputed"),
     },
     "payment": {("received", "allocated")},
     "dispute": {("none", "under_review")},
@@ -109,6 +112,18 @@ ANOMALY_CODES = {
     "order_closed_with_unpaid_invoice",
     "status_event_skips_state",
     "dispute_not_in_receivables",
+    "underbilling",
+    "duplicate_invoice",
+}
+
+STATE_ENTITY_TABLES = {
+    "account": ("accounts", "account_id", "account_status"),
+    "quote": ("quotes", "quote_id", "quote_status"),
+    "sales_order": ("sales_orders", "sales_order_id", "order_status"),
+    "shipment": ("shipments", "shipment_id", "shipment_status"),
+    "invoice": ("invoices", "invoice_id", "invoice_status"),
+    "payment": ("payments", "payment_id", "payment_status"),
+    "dispute": ("disputes", "dispute_id", "dispute_status"),
 }
 
 MONEY_COLUMNS = {
@@ -119,10 +134,17 @@ MONEY_COLUMNS = {
     "order_lines": ("unit_price", "line_amount"),
     "shipments": ("fulfilled_amount",),
     "invoices": ("invoice_amount", "tax_amount", "total_due", "balance_due"),
-    "invoice_lines": ("line_amount",),
+    "invoice_lines": ("unit_price", "line_amount"),
     "payments": ("payment_amount", "unapplied_amount"),
     "payment_allocations": ("allocated_amount",),
     "disputes": ("dispute_amount",),
+}
+
+QUANTITY_COLUMNS = {
+    "quote_lines": ("quantity",),
+    "order_lines": ("quantity",),
+    "shipments": ("fulfilled_quantity",),
+    "invoice_lines": ("quantity",),
 }
 
 MONEY_PATTERN = re.compile(r"^-?\d+\.\d{2}$")
@@ -160,9 +182,11 @@ class LedgerAuditor:
         self,
         tables: dict[str, pd.DataFrame],
         expected_volumes: dict[str, int],
+        volume_plan: VolumePlan = VOLUME_PLAN,
     ) -> None:
         self.tables = tables
         self.expected_volumes = expected_volumes
+        self.volume_plan = volume_plan
 
     def run(self) -> VerificationReport:
         report = VerificationReport()
@@ -170,12 +194,14 @@ class LedgerAuditor:
         self._check_primary_keys(report)
         self._check_id_formats(report)
         self._check_money_formats(report)
+        self._check_quantities(report)
         self._check_foreign_keys(report)
         self._check_relationship_consistency(report)
         self._check_lifecycle_states(report)
         self._check_chronology(report)
         detections = self._detect_anomalies()
         self._check_lifecycle_transitions(report, detections)
+        self._check_event_history(report, detections)
         self._check_financials(report, detections)
         self._report_anomalies(report, detections)
         self._check_ground_truth_isolation(report)
@@ -193,6 +219,8 @@ class LedgerAuditor:
             return len(self.tables[parent_counts[table]])
         if table == "payment_allocations":
             return len(self.tables["payments"]) + 1
+        if table == "ground_truth":
+            return len(ANOMALY_CODES)
         return None
 
     def _check_volumes(self, report: VerificationReport) -> None:
@@ -205,6 +233,17 @@ class LedgerAuditor:
                 passed,
                 f"expected={expected if expected is not None else 'non-empty'} actual={actual}",
             )
+        combined_actual = len(self.tables["payments"]) + len(
+            self.tables["status_events"]
+        )
+        report.add(
+            "volume:payments_and_status_events",
+            combined_actual >= self.volume_plan.timeline_events,
+            f"expected_at_least={self.volume_plan.timeline_events} "
+            f"payments={len(self.tables['payments'])} "
+            f"status_events={len(self.tables['status_events'])} "
+            f"combined={combined_actual}",
+        )
 
     def _check_primary_keys(self, report: VerificationReport) -> None:
         for table, columns in PRIMARY_KEYS.items():
@@ -245,10 +284,28 @@ class LedgerAuditor:
                     f"examples={values[malformed].head(5).tolist()}",
                 )
 
+    def _check_quantities(self, report: VerificationReport) -> None:
+        for table, columns in QUANTITY_COLUMNS.items():
+            for column in columns:
+                values = pd.to_numeric(self.tables[table][column], errors="coerce")
+                invalid = values.isna() | (values <= 0) | (values % 1 != 0)
+                report.add(
+                    f"quantity:positive_integer:{table}.{column}",
+                    not bool(invalid.any()),
+                    f"invalid_count={int(invalid.sum())} "
+                    f"examples={self.tables[table].loc[invalid, column].head(5).tolist()}",
+                )
+
     def _cents(self, table: str, column: str) -> pd.Series:
         values = self.tables[table][column].astype("string")
         valid = values.str.fullmatch(MONEY_PATTERN, na=False)
         return values.where(valid, "0.00").map(cents_from_text).astype("int64")
+
+    @staticmethod
+    def _cents_from_values(values: pd.Series) -> pd.Series:
+        text = values.astype("string")
+        valid = text.str.fullmatch(MONEY_PATTERN, na=False)
+        return text.where(valid, "0.00").map(cents_from_text).astype("int64")
 
     def _check_foreign_keys(self, report: VerificationReport) -> None:
         for child, child_column, parent, parent_column in FOREIGN_KEYS:
@@ -315,10 +372,26 @@ class LedgerAuditor:
             suffixes=("_line", "_shipment"),
         )
         order_line_quotes = (
-            self.tables["order_lines"][["sales_order_id", "quote_line_id"]]
+            self.tables["order_lines"][
+                [
+                    "sales_order_id",
+                    "quote_line_id",
+                    "quantity",
+                    "unit_price",
+                    "line_amount",
+                ]
+            ]
             .merge(orders[["sales_order_id", "quote_id"]], on="sales_order_id")
             .merge(
-                self.tables["quote_lines"][["quote_line_id", "quote_id"]],
+                self.tables["quote_lines"][
+                    [
+                        "quote_line_id",
+                        "quote_id",
+                        "quantity",
+                        "unit_price",
+                        "line_amount",
+                    ]
+                ],
                 on="quote_line_id",
                 suffixes=("_order", "_line"),
             )
@@ -375,6 +448,22 @@ class LedgerAuditor:
                 count == 0,
                 f"mismatch_count={count}",
             )
+        order_quantity_mismatches = int(
+            order_line_quotes["quantity_order"].ne(
+                order_line_quotes["quantity_line"]
+            ).sum()
+        )
+        order_price_mismatches = int(
+            self._cents_from_values(order_line_quotes["unit_price_order"]).ne(
+                self._cents_from_values(order_line_quotes["unit_price_line"])
+            ).sum()
+        )
+        report.add(
+            "relationship:order_line_quantity_price_matches_quote_line",
+            order_quantity_mismatches == 0 and order_price_mismatches == 0,
+            f"quantity_mismatches={order_quantity_mismatches} "
+            f"unit_price_mismatches={order_price_mismatches}",
+        )
 
     def _check_lifecycle_states(self, report: VerificationReport) -> None:
         for (table, column), allowed in ALLOWED_STATES.items():
@@ -553,9 +642,27 @@ class LedgerAuditor:
         fulfilled = shipments.groupby("sales_order_id")["_fulfilled_cents"].sum().to_dict()
         invoices = self.tables["invoices"].copy()
         invoices["_amount_cents"] = self._cents("invoices", "invoice_amount")
+        duplicate_signature = [
+            "sales_order_id",
+            "shipment_id",
+            "account_id",
+            "invoice_amount",
+            "tax_amount",
+            "total_due",
+            "balance_due",
+            "currency",
+            "invoice_status",
+            "issued_at",
+            "due_at",
+        ]
+        duplicates = invoices.duplicated(duplicate_signature, keep="first")
+        detections["duplicate_invoice"].update(
+            invoices.loc[duplicates, "invoice_id"].astype(str)
+        )
         billed_by_order: dict[str, int] = {}
         crossed_limit: set[str] = set()
-        for index, row in invoices.iterrows():
+        nonduplicates = invoices.loc[~duplicates]
+        for index, row in nonduplicates.iterrows():
             order_id = row.sales_order_id
             amount = int(invoices.at[index, "_amount_cents"])
             billed_by_order[order_id] = billed_by_order.get(order_id, 0) + amount
@@ -565,6 +672,50 @@ class LedgerAuditor:
             ):
                 detections["invoice_exceeds_fulfillment"].add(row["invoice_id"])
                 crossed_limit.add(order_id)
+
+        shipment_quantities = pd.to_numeric(
+            self.tables["shipments"]["fulfilled_quantity"], errors="coerce"
+        )
+        fulfilled_quantity_by_order = (
+            self.tables["shipments"]
+            .assign(_quantity=shipment_quantities)
+            .groupby("sales_order_id")["_quantity"]
+            .sum()
+            .to_dict()
+        )
+        invoice_line_quantities = pd.to_numeric(
+            self.tables["invoice_lines"]["quantity"], errors="coerce"
+        )
+        quantity_by_invoice = (
+            self.tables["invoice_lines"]
+            .assign(_quantity=invoice_line_quantities)
+            .groupby("invoice_id")["_quantity"]
+            .sum()
+            .to_dict()
+        )
+        billed_quantity_by_order: dict[str, int] = {}
+        quantity_crossed_limit: set[str] = set()
+        for _, row in nonduplicates.iterrows():
+            invoice_id = str(row["invoice_id"])
+            order_id = str(row["sales_order_id"])
+            quantity = int(quantity_by_invoice.get(invoice_id, 0))
+            billed_quantity_by_order[order_id] = (
+                billed_quantity_by_order.get(order_id, 0) + quantity
+            )
+            if (
+                order_id not in quantity_crossed_limit
+                and billed_quantity_by_order[order_id]
+                > fulfilled_quantity_by_order.get(order_id, 0)
+            ):
+                detections["invoice_exceeds_fulfillment"].add(invoice_id)
+                quantity_crossed_limit.add(order_id)
+
+        for order_id, fulfilled_amount in fulfilled.items():
+            if billed_by_order.get(order_id, 0) < fulfilled_amount:
+                detections["underbilling"].add(order_id)
+        for order_id, fulfilled_quantity in fulfilled_quantity_by_order.items():
+            if billed_quantity_by_order.get(order_id, 0) < fulfilled_quantity:
+                detections["underbilling"].add(order_id)
 
         allocations = self.tables["payment_allocations"].copy()
         allocations["_allocated_cents"] = self._cents(
@@ -632,6 +783,61 @@ class LedgerAuditor:
             f"observed_invalid_count={len(invalid)} "
             f"known_scenario_event_ids={sorted(expected_scenario)} "
             f"unexpected_invalid_event_ids={sorted(unexpected)}",
+        )
+
+    def _check_event_history(
+        self,
+        report: VerificationReport,
+        detections: dict[str, set[str]],
+    ) -> None:
+        events = self.tables["status_events"].copy()
+        events["_parsed_at"] = self._timestamps(events, "occurred_at")
+        incomplete = []
+        broken_chains = []
+        skipped_events = detections["status_event_skips_state"]
+
+        for entity_type, (table, key, status_column) in STATE_ENTITY_TABLES.items():
+            state_rows = self.tables[table]
+            grouped = {
+                entity_id: rows.sort_values(
+                    ["_parsed_at", "event_id"], kind="stable"
+                )
+                for entity_id, rows in events.loc[
+                    events["entity_type"] == entity_type
+                ].groupby("entity_id", sort=False)
+            }
+
+            for row in state_rows.itertuples(index=False):
+                entity_id = getattr(row, key)
+                history = grouped.get(entity_id)
+                if history is None or history.empty:
+                    incomplete.append((entity_type, entity_id, "missing"))
+                    continue
+                if history.iloc[-1]["to_status"] != getattr(row, status_column):
+                    incomplete.append(
+                        (
+                            entity_type,
+                            entity_id,
+                            f"last={history.iloc[-1]['to_status']} "
+                            f"current={getattr(row, status_column)}",
+                        )
+                    )
+
+                prior = None
+                for event in history.itertuples(index=False):
+                    if prior is not None and event.event_id not in skipped_events:
+                        if event.from_status != prior:
+                            broken_chains.append(
+                                (entity_type, entity_id, event.event_id)
+                            )
+                    prior = event.to_status
+
+        report.add(
+            "lifecycle:event_history_complete",
+            not incomplete and not broken_chains,
+            f"state_entities={sum(len(self.tables[table]) for table, _, _ in STATE_ENTITY_TABLES.values())} "
+            f"incomplete_or_mismatched={len(incomplete)} examples={incomplete[:5]} "
+            f"broken_chains={len(broken_chains)} examples={broken_chains[:5]}",
         )
 
     def _check_financials(
@@ -716,6 +922,235 @@ class LedgerAuditor:
             f"mismatches={len(line_mismatches)} missing_lines={len(missing_invoice_lines)} "
             f"invoice_ids={sorted(line_mismatches)[:5]}",
         )
+        invoice_line_quantity = pd.to_numeric(
+            invoice_lines["quantity"], errors="coerce"
+        )
+        invoice_line_unit_price = self._cents(
+            "invoice_lines", "unit_price"
+        )
+        invoice_extension_mismatch = (
+            invoice_line_quantity.isna()
+            | (
+                invoice_lines["_line_cents"]
+                != invoice_line_unit_price * invoice_line_quantity.fillna(0)
+            )
+        )
+        report.add(
+            "financial:invoice_line_quantity_times_unit_price",
+            not bool(invoice_extension_mismatch.any()),
+            f"mismatches={int(invoice_extension_mismatch.sum())} "
+            f"line_ids={invoice_lines.loc[invoice_extension_mismatch, 'invoice_line_id'].head(5).tolist()}",
+        )
+
+        shipped_by_order = self.tables["shipments"].copy()
+        shipped_by_order["_fulfilled_cents"] = self._cents(
+            "shipments", "fulfilled_amount"
+        )
+        fulfilled_by_order = shipped_by_order.groupby("sales_order_id")[
+            "_fulfilled_cents"
+        ].sum()
+        billed_by_order = invoice_amount.groupby(invoices["sales_order_id"]).sum()
+        all_order_ids = set(fulfilled_by_order.index) | set(billed_by_order.index)
+        observed_billing_deltas = {
+            order_id: int(billed_by_order.get(order_id, 0) - fulfilled_by_order.get(order_id, 0))
+            for order_id in sorted(all_order_ids)
+            if billed_by_order.get(order_id, 0)
+            != fulfilled_by_order.get(order_id, 0)
+        }
+        expected_billing_deltas: dict[str, int] = {}
+        truth = self.tables["ground_truth"]
+        for code in (
+            "invoice_exceeds_fulfillment",
+            "underbilling",
+            "duplicate_invoice",
+        ):
+            fault_rows = truth.loc[truth["anomaly_code"] == code]
+            if len(fault_rows) != 1:
+                continue
+            fault = fault_rows.iloc[0]
+            if code == "invoice_exceeds_fulfillment":
+                match = re.search(r"delta_cents=(\d+)", str(fault["notes"]))
+                if match:
+                    expected_billing_deltas[str(fault["related_ids"])] = int(
+                        match.group(1)
+                    )
+            elif code == "underbilling":
+                match = re.search(r"delta_cents=(\d+)", str(fault["notes"]))
+                if match:
+                    expected_billing_deltas[str(fault["anchor_id"])] = -int(
+                        match.group(1)
+                    )
+            else:
+                duplicate_id = str(fault["anchor_id"])
+                duplicate_invoice = invoices.loc[
+                    invoices["invoice_id"] == duplicate_id
+                ]
+                if len(duplicate_invoice) == 1:
+                    order_id = str(duplicate_invoice.iloc[0]["sales_order_id"])
+                    expected_billing_deltas[order_id] = (
+                        expected_billing_deltas.get(order_id, 0)
+                        + int(invoice_amount.loc[duplicate_invoice.index[0]])
+                    )
+        report.add(
+            "financial:fulfillment_to_invoice_reconciliation",
+            observed_billing_deltas == expected_billing_deltas,
+            f"cutoff={AS_OF_TS.date().isoformat()} "
+            f"expected_deltas_cents={expected_billing_deltas} "
+            f"observed_deltas_cents={observed_billing_deltas} "
+            f"unexpected_orders={sorted(set(observed_billing_deltas) - set(expected_billing_deltas))[:10]}",
+        )
+
+        order_quantities = pd.to_numeric(
+            self.tables["order_lines"]["quantity"], errors="coerce"
+        )
+        ordered_by_order = self.tables["order_lines"].assign(
+            _quantity=order_quantities
+        ).groupby("sales_order_id")["_quantity"].sum()
+        shipped_quantities = pd.to_numeric(
+            self.tables["shipments"]["fulfilled_quantity"], errors="coerce"
+        )
+        fulfilled_by_order_quantity = self.tables["shipments"].assign(
+            _quantity=shipped_quantities
+        ).groupby("sales_order_id")["_quantity"].sum()
+        invoice_line_quantities = pd.to_numeric(
+            invoice_lines["quantity"], errors="coerce"
+        )
+        quantity_invoice_lines = invoice_lines.assign(
+            _quantity=invoice_line_quantities
+        ).merge(
+            invoices[["invoice_id", "sales_order_id"]],
+            on="invoice_id",
+            suffixes=("_line", "_invoice"),
+        )
+        invoice_quantity_by_order = quantity_invoice_lines.groupby(
+            "sales_order_id_invoice"
+        )["_quantity"].sum()
+        all_quantity_order_ids = (
+            set(ordered_by_order.index)
+            | set(fulfilled_by_order_quantity.index)
+            | set(invoice_quantity_by_order.index)
+        )
+        observed_quantity_deltas = {
+            order_id: int(
+                invoice_quantity_by_order.get(order_id, 0)
+                - fulfilled_by_order_quantity.get(order_id, 0)
+            )
+            for order_id in sorted(all_quantity_order_ids)
+            if invoice_quantity_by_order.get(order_id, 0)
+            != fulfilled_by_order_quantity.get(order_id, 0)
+        }
+        expected_quantity_deltas: dict[str, int] = {}
+        for code in (
+            "invoice_exceeds_fulfillment",
+            "underbilling",
+            "duplicate_invoice",
+        ):
+            fault_rows = truth.loc[truth["anomaly_code"] == code]
+            if len(fault_rows) != 1:
+                continue
+            fault = fault_rows.iloc[0]
+            if code == "invoice_exceeds_fulfillment":
+                match = re.search(r"delta_units=(\d+)", str(fault["notes"]))
+                if match:
+                    expected_quantity_deltas[str(fault["related_ids"])] = int(
+                        match.group(1)
+                    )
+            elif code == "underbilling":
+                match = re.search(r"delta_units=(\d+)", str(fault["notes"]))
+                if match:
+                    expected_quantity_deltas[str(fault["anchor_id"])] = -int(
+                        match.group(1)
+                    )
+            else:
+                duplicate_invoice_id = str(fault["anchor_id"])
+                duplicate_invoice = invoices.loc[
+                    invoices["invoice_id"] == duplicate_invoice_id
+                ]
+                duplicate_quantity = invoice_lines.loc[
+                    invoice_lines["invoice_id"] == duplicate_invoice_id,
+                    "quantity",
+                ]
+                if len(duplicate_invoice) == 1 and len(duplicate_quantity):
+                    order_id = str(duplicate_invoice.iloc[0]["sales_order_id"])
+                    expected_quantity_deltas[order_id] = (
+                        expected_quantity_deltas.get(order_id, 0)
+                        + int(pd.to_numeric(duplicate_quantity).sum())
+                    )
+
+        report.add(
+            "quantity:fulfillment_to_invoice_reconciliation",
+            observed_quantity_deltas == expected_quantity_deltas,
+            f"expected_invoice_minus_fulfilled={expected_quantity_deltas} "
+            f"observed_invoice_minus_fulfilled={observed_quantity_deltas} "
+            f"ordered_quantity={int(ordered_by_order.sum())} "
+            f"fulfilled_quantity={int(fulfilled_by_order_quantity.sum())} "
+            f"invoiced_quantity={int(invoice_quantity_by_order.sum())}",
+        )
+        over_ordered_shipments = fulfilled_by_order_quantity.subtract(
+            ordered_by_order, fill_value=0
+        )
+        shipment_quantity_violations = over_ordered_shipments[
+            over_ordered_shipments > 0
+        ]
+        report.add(
+            "quantity:shipment_not_exceed_ordered",
+            shipment_quantity_violations.empty,
+            f"overage_orders={shipment_quantity_violations.to_dict()}",
+        )
+
+        excluded_invoice_ids = (
+            detections["invoice_exceeds_fulfillment"]
+            | detections["duplicate_invoice"]
+        )
+        ordinary_invoice_lines = quantity_invoice_lines.loc[
+            ~quantity_invoice_lines["invoice_id"].isin(excluded_invoice_ids)
+        ]
+        ordinary_invoiced_by_order = ordinary_invoice_lines.groupby(
+            "sales_order_id_invoice"
+        )["_quantity"].sum()
+        ordinary_overages = {
+            order_id: int(quantity - fulfilled_by_order_quantity.get(order_id, 0))
+            for order_id, quantity in ordinary_invoiced_by_order.items()
+            if quantity > fulfilled_by_order_quantity.get(order_id, 0)
+        }
+        report.add(
+            "quantity:ordinary_invoice_quantity_not_exceed_fulfilled",
+            not ordinary_overages,
+            f"overage_orders={ordinary_overages}",
+        )
+
+        due_dates = self._timestamps(invoices, "due_at")
+        invalid_due_dates = due_dates.isna()
+        ages = (pd.Timestamp(AS_OF_TS) - due_dates).dt.total_seconds() / 86400
+        aging_groups = {
+            "not_due": ages <= 0,
+            "1_30_days": (ages > 0) & (ages <= 30),
+            "31_60_days": (ages > 30) & (ages <= 60),
+            "61_90_days": (ages > 60) & (ages <= 90),
+            "over_90_days": ages > 90,
+        }
+        aging_summary = {}
+        for name, mask in aging_groups.items():
+            selected = mask.fillna(False)
+            aging_summary[name] = {
+                "invoice_count": int(selected.sum()),
+                "open_balance_cents": int(balance_due.loc[selected].sum()),
+            }
+        aged_balance = sum(
+            bucket["open_balance_cents"] for bucket in aging_summary.values()
+        )
+        disputed_balance = int(
+            balance_due.loc[invoices["invoice_status"] == "disputed"].sum()
+        )
+        report.add(
+            "financial:aging_at_fixed_cutoff",
+            not bool(invalid_due_dates.any())
+            and aged_balance == int(balance_due.sum())
+            and aging_summary["over_90_days"]["invoice_count"] > 0,
+            f"cutoff={AS_OF_TS.isoformat()} invalid_due_dates={int(invalid_due_dates.sum())} "
+            f"bucket_totals={aging_summary} disputed_balance_cents={disputed_balance} "
+            f"reconciled_balance_cents={aged_balance}",
+        )
 
         for table, parent_key, child_key, amount_column in (
             ("quote_lines", "quote_id", "quote_id", "quoted_amount"),
@@ -758,6 +1193,31 @@ class LedgerAuditor:
                 f"mismatches={int(mismatch.sum())} "
                 f"row_indexes={frame.index[mismatch].tolist()[:5]}",
             )
+
+        shipment_extensions = self.tables["shipments"][
+            ["sales_order_id", "fulfilled_quantity", "fulfilled_amount"]
+        ].merge(
+            self.tables["order_lines"][["sales_order_id", "unit_price"]],
+            on="sales_order_id",
+        )
+        shipment_quantity = pd.to_numeric(
+            shipment_extensions["fulfilled_quantity"], errors="coerce"
+        )
+        shipment_unit_price = self._cents_from_values(
+            shipment_extensions["unit_price"]
+        )
+        shipment_amount = self._cents_from_values(
+            shipment_extensions["fulfilled_amount"]
+        )
+        shipment_extension_mismatch = (
+            shipment_quantity.isna()
+            | (shipment_amount != shipment_unit_price * shipment_quantity.fillna(0))
+        )
+        report.add(
+            "financial:shipment_quantity_times_order_unit_price",
+            not bool(shipment_extension_mismatch.any()),
+            f"mismatches={int(shipment_extension_mismatch.sum())}",
+        )
 
         allocations = self.tables["payment_allocations"].copy()
         allocations["_allocated_cents"] = self._cents(

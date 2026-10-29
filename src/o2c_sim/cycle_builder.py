@@ -24,6 +24,7 @@ from o2c_sim.settings import (
     QUOTE_REASONS,
     REGIONS,
     VOLUME_PLAN,
+    VolumePlan,
 )
 
 
@@ -35,9 +36,15 @@ def _clip_later(entropy: StreamedEntropy, origin: datetime, min_hours: int, max_
     return entropy.later_than(origin, min_hours, max_hours, AS_OF_TS)
 
 class CausalCycleAssembler:
-    def __init__(self, entropy: StreamedEntropy, desk: SequenceDesk) -> None:
+    def __init__(
+        self,
+        entropy: StreamedEntropy,
+        desk: SequenceDesk,
+        volume_plan: VolumePlan = VOLUME_PLAN,
+    ) -> None:
         self.entropy = entropy
         self.desk = desk
+        self.volume_plan = volume_plan
 
     def assemble_initial_records(self) -> dict[str, list[dict]]:
         accounts = self._build_accounts()
@@ -55,8 +62,8 @@ class CausalCycleAssembler:
                 "quote_id": quote["quote_id"],
                 "line_number": 1,
                 "description": "Synthetic service item",
-                "quantity": 1,
-                "unit_price": quote["quoted_amount"],
+                "quantity": quote["_quantity"],
+                "unit_price": format_cents(quote["_unit_price_cents"]),
                 "line_amount": quote["quoted_amount"],
                 "currency": quote["currency"],
             })
@@ -78,8 +85,8 @@ class CausalCycleAssembler:
                 "quote_line_id": quote_line_id,
                 "line_number": 1,
                 "description": "Synthetic service item",
-                "quantity": 1,
-                "unit_price": order["order_amount"],
+                "quantity": order["_quantity"],
+                "unit_price": format_cents(order["_unit_price_cents"]),
                 "line_amount": order["order_amount"],
                 "currency": order["currency"],
             })
@@ -100,7 +107,8 @@ class CausalCycleAssembler:
                 "shipment_id": invoice.get("shipment_id", ""),
                 "line_number": 1,
                 "description": "Synthetic service item",
-                "quantity": 1,
+                "quantity": invoice["_quantity"],
+                "unit_price": format_cents(invoice["_unit_price_cents"]),
                 "line_amount": invoice["invoice_amount"],
                 "currency": invoice["currency"],
             })
@@ -136,7 +144,7 @@ class CausalCycleAssembler:
 
     def _build_accounts(self) -> list[dict]:
         rows: list[dict] = []
-        for _ in range(VOLUME_PLAN.accounts):
+        for _ in range(self.volume_plan.accounts):
             opened = self.entropy.stamp_between(CALENDAR.open_on, CALENDAR.open_on.replace(year=2026, month=2, day=28))
             industry = self.entropy.pick(INDUSTRIES)
             region = self.entropy.pick(REGIONS)
@@ -159,8 +167,8 @@ class CausalCycleAssembler:
 
     def _build_quotes(self, accounts: list[dict]) -> list[dict]:
         rows: list[dict] = []
-        accepted_budget = VOLUME_PLAN.sales_orders
-        for idx in range(VOLUME_PLAN.quotes):
+        accepted_budget = self.volume_plan.sales_orders
+        for idx in range(self.volume_plan.quotes):
             account = accounts[int(self.entropy.integers(0, len(accounts)))]
             issued = _clip_later(
                 self.entropy,
@@ -169,6 +177,9 @@ class CausalCycleAssembler:
                 24 * 40,
             )
             amount = self.entropy.cents(18_500_00, 620_000_00)
+            quantity = 2 + idx % 19
+            unit_price = amount // quantity
+            amount = unit_price * quantity
             expires = issued + timedelta(days=int(self.entropy.integers(14, 46)))
             will_accept = idx < accepted_budget
             if will_accept:
@@ -192,6 +203,8 @@ class CausalCycleAssembler:
                     "expires_at": _iso(expires),
                     "decided_at": _iso(decided),
                     "_amount_cents": amount,
+                    "_quantity": quantity,
+                    "_unit_price_cents": unit_price,
                     "_issued_at": issued,
                     "_decided_at": decided,
                     "_account": account,
@@ -201,7 +214,7 @@ class CausalCycleAssembler:
 
     def _build_sales_orders(self, quotes: list[dict]) -> list[dict]:
         accepted = [q for q in quotes if q["quote_status"] == "accepted"]
-        if len(accepted) != VOLUME_PLAN.sales_orders:
+        if len(accepted) != self.volume_plan.sales_orders:
             raise RuntimeError("accepted quote count must equal sales order target")
         rows: list[dict] = []
         for quote in accepted:
@@ -217,9 +230,12 @@ class CausalCycleAssembler:
                     "booked_at": _iso(booked),
                     "closed_at": "",
                     "_amount_cents": quote["_amount_cents"],
+                    "_quantity": quote["_quantity"],
+                    "_unit_price_cents": quote["_unit_price_cents"],
                     "_booked_at": booked,
                     "_account": quote["_account"],
                     "_fulfilled_cents": 0,
+                    "_fulfilled_quantity": 0,
                 }
             )
         return rows
@@ -230,40 +246,56 @@ class CausalCycleAssembler:
             if self.entropy.chance(0.035):
                 continue
             legs = 2 if self.entropy.chance(0.08) else 1
-            remaining = order["_amount_cents"]
+            remaining_quantity = order["_quantity"]
             cursor = order["_booked_at"]
             for leg in range(legs):
                 if leg == legs - 1:
-                    fulfilled = remaining
+                    fulfilled_quantity = remaining_quantity
                 else:
-                    fulfilled = int(remaining * (0.42 + 0.2 * self.entropy.unit()))
-                    remaining -= fulfilled
+                    share = 0.42 + 0.2 * self.entropy.unit()
+                    fulfilled_quantity = max(
+                        1,
+                        min(
+                            remaining_quantity - 1,
+                            int(remaining_quantity * share),
+                        ),
+                    )
+                    remaining_quantity -= fulfilled_quantity
+                fulfilled = (
+                    fulfilled_quantity * order["_unit_price_cents"]
+                )
                 packed = _clip_later(self.entropy, cursor, 4, 96)
                 shipped = _clip_later(self.entropy, packed, 2, 48)
                 delivered = _clip_later(self.entropy, shipped, 12, 160)
                 cursor = delivered
                 order["_fulfilled_cents"] += fulfilled
+                order["_fulfilled_quantity"] += fulfilled_quantity
                 rows.append(
                     {
                         "shipment_id": self.desk.next_id(PREFIX_SHIPMENT),
                         "sales_order_id": order["sales_order_id"],
                         "account_id": order["account_id"],
+                        "fulfilled_quantity": fulfilled_quantity,
                         "fulfilled_amount": format_cents(fulfilled),
                         "shipment_status": "delivered",
                         "packed_at": _iso(packed),
                         "shipped_at": _iso(shipped),
                         "delivered_at": _iso(delivered),
                         "_fulfilled_cents": fulfilled,
+                        "_fulfilled_quantity": fulfilled_quantity,
+                        "_packed_at": packed,
+                        "_shipped_at": shipped,
                         "_delivered_at": delivered,
                     }
                 )
-            if order["_fulfilled_cents"] >= order["_amount_cents"]:
+            if order["_fulfilled_quantity"] >= order["_quantity"]:
                 order["order_status"] = "fulfilled"
             else:
                 order["order_status"] = "in_fulfillment"
         still_open = [o for o in sales_orders if o["order_status"] == "booked"]
         for order in still_open:
             order["_fulfilled_cents"] = 0
+            order["_fulfilled_quantity"] = 0
         return rows
 
     def _build_invoices(self, sales_orders: list[dict], shipments: list[dict]) -> list[dict]:
@@ -273,11 +305,15 @@ class CausalCycleAssembler:
 
         billed: list[dict] = []
         shipped_order_ids = [sid for sid in by_order.keys()]
-        split_count = VOLUME_PLAN.invoices - len(shipped_order_ids)
+        base_invoice_target = (
+            self.volume_plan.invoices
+            - self.volume_plan.duplicate_invoice_records
+        )
+        split_count = base_invoice_target - len(shipped_order_ids)
         if split_count < 0 or split_count > len(shipped_order_ids):
             raise RuntimeError(
                 "invoice target cannot be met with at most two invoices per "
-                f"shipped order: target={VOLUME_PLAN.invoices} "
+                f"shipped order: target={base_invoice_target} "
                 f"shipped_orders={len(shipped_order_ids)}"
             )
         split_ids = set(shipped_order_ids[:split_count])
@@ -288,25 +324,78 @@ class CausalCycleAssembler:
                 continue
 
             if order["sales_order_id"] in split_ids:
-                first = int(order["_fulfilled_cents"] * 0.45)
-                second = order["_fulfilled_cents"] - first
-                t1 = _clip_later(self.entropy, legs[0]["_delivered_at"], 2, 48)
-                billed.append(self._invoice_row(order, legs[0], first, t1, "open"))
-                t2 = _clip_later(self.entropy, legs[-1]["_delivered_at"], 6, 72)
-                billed.append(self._invoice_row(order, legs[-1], second, t2, "open"))
+                if len(legs) == 2:
+                    for leg in legs:
+                        issued = _clip_later(
+                            self.entropy, leg["_delivered_at"], 2, 48
+                        )
+                        billed.append(
+                            self._invoice_row(
+                                order,
+                                leg,
+                                leg["_fulfilled_quantity"],
+                                issued,
+                                "open",
+                            )
+                        )
+                else:
+                    first_quantity = max(
+                        1,
+                        min(
+                            order["_fulfilled_quantity"] - 1,
+                            int(order["_fulfilled_quantity"] * 0.45),
+                        ),
+                    )
+                    second_quantity = (
+                        order["_fulfilled_quantity"] - first_quantity
+                    )
+                    first_issued = _clip_later(
+                        self.entropy, legs[0]["_delivered_at"], 2, 48
+                    )
+                    billed.append(
+                        self._invoice_row(
+                            order, legs[0], first_quantity, first_issued, "open"
+                        )
+                    )
+                    second_issued = _clip_later(
+                        self.entropy, legs[0]["_delivered_at"], 6, 72
+                    )
+                    billed.append(
+                        self._invoice_row(
+                            order, legs[0], second_quantity, second_issued, "open"
+                        )
+                    )
             else:
-                amount = order["_fulfilled_cents"]
-                issued = _clip_later(self.entropy, legs[-1]["_delivered_at"], 2, 60)
-                billed.append(self._invoice_row(order, legs[-1], amount, issued, "open"))
+                issued = _clip_later(
+                    self.entropy, legs[-1]["_delivered_at"], 2, 60
+                )
+                shipment = legs[0] if len(legs) == 1 else None
+                billed.append(
+                    self._invoice_row(
+                        order,
+                        shipment,
+                        order["_fulfilled_quantity"],
+                        issued,
+                        "open",
+                    )
+                )
 
-        if len(billed) != VOLUME_PLAN.invoices:
+        if len(billed) != base_invoice_target:
             raise RuntimeError(
                 "invoice assembly did not meet volume target: "
-                f"expected={VOLUME_PLAN.invoices} actual={len(billed)}"
+                f"expected={base_invoice_target} actual={len(billed)}"
             )
         return billed
 
-    def _invoice_row(self, order: dict, shipment: dict | None, amount: int, issued: datetime, status: str) -> dict:
+    def _invoice_row(
+        self,
+        order: dict,
+        shipment: dict | None,
+        quantity: int,
+        issued: datetime,
+        status: str,
+    ) -> dict:
+        amount = quantity * order["_unit_price_cents"]
         tax = 0 if order["_account"]["region"].startswith("NA") else int(round(amount * 0.08))
         total = amount + tax
         due = issued + timedelta(days=30)
@@ -327,6 +416,8 @@ class CausalCycleAssembler:
             "_tax_cents": tax,
             "_total_cents": total,
             "_balance_cents": total,
+            "_quantity": quantity,
+            "_unit_price_cents": order["_unit_price_cents"],
             "_issued_at": issued,
             "_order_ref": order,
         }
@@ -342,12 +433,12 @@ class CausalCycleAssembler:
                 continue
             eligible.append(invoice)
 
-        if len(eligible) < VOLUME_PLAN.payments:
+        if len(eligible) < self.volume_plan.payments:
             raise RuntimeError(
                 "insufficient eligible invoices for payment target: "
-                f"expected={VOLUME_PLAN.payments} eligible={len(eligible)}"
+                f"expected={self.volume_plan.payments} eligible={len(eligible)}"
             )
-        excess = len(eligible) - VOLUME_PLAN.payments
+        excess = len(eligible) - self.volume_plan.payments
         skipped = set()
         while len(skipped) < excess:
             skipped.add(int(self.entropy.integers(0, len(eligible))))
@@ -378,6 +469,8 @@ class CausalCycleAssembler:
                     "_posted_at": posted,
                 }
             )
+            invoice["_settled_status"] = invoice["invoice_status"]
+            invoice["_settled_at"] = posted
             allocations.append(
                 {
                     "payment_id": payment_id,
@@ -440,14 +533,18 @@ class CausalCycleAssembler:
 
     def _build_disputes(self, invoices: list[dict]) -> list[dict]:
         candidates = [inv for inv in invoices if inv["invoice_status"] in {"open", "partial"}]
-        if len(candidates) < VOLUME_PLAN.disputes:
+        if len(candidates) < self.volume_plan.disputes:
             raise RuntimeError(
                 "insufficient eligible invoices for dispute target: "
-                f"expected={VOLUME_PLAN.disputes} eligible={len(candidates)}"
+                f"expected={self.volume_plan.disputes} eligible={len(candidates)}"
             )
         rows: list[dict] = []
-        for invoice in candidates[:VOLUME_PLAN.disputes]:
-            opened = _clip_later(self.entropy, invoice["_issued_at"], 12, 24 * 18)
+        for invoice in candidates[:self.volume_plan.disputes]:
+            dispute_origin = max(
+                invoice["_issued_at"],
+                invoice.get("_settled_at", invoice["_issued_at"]),
+            )
+            opened = _clip_later(self.entropy, dispute_origin, 12, 24 * 18)
             claimed = min(invoice["_balance_cents"], max(5_000, int(invoice["_total_cents"] * 0.2)))
             invoice["invoice_status"] = "disputed"
             rows.append(
@@ -479,8 +576,14 @@ class CausalCycleAssembler:
         def add(ts: datetime, entity_type: str, entity_id: str, prior: str, current: str) -> None:
             sketches.append((ts, entity_type, entity_id, prior, current))
 
-        for account in accounts[:1200]:
-            add(account["_opened_at"], "account", account["account_id"], "prospect", "active")
+        for account in accounts:
+            add(
+                account["_opened_at"],
+                "account",
+                account["account_id"],
+                "prospect",
+                account["account_status"],
+            )
 
         for quote in quotes:
             add(quote["_issued_at"], "quote", quote["quote_id"], "draft", "sent")
@@ -488,9 +591,14 @@ class CausalCycleAssembler:
 
         for order in sales_orders:
             add(order["_booked_at"], "sales_order", order["sales_order_id"], "none", "booked")
-            if order["order_status"] in {"in_fulfillment", "fulfilled", "closed"}:
+            order_shipments = [
+                shipment
+                for shipment in shipments
+                if shipment["sales_order_id"] == order["sales_order_id"]
+            ]
+            if order_shipments:
                 add(
-                    order["_booked_at"] + timedelta(hours=6),
+                    min(shipment["_packed_at"] for shipment in order_shipments),
                     "sales_order",
                     order["sales_order_id"],
                     "booked",
@@ -498,7 +606,7 @@ class CausalCycleAssembler:
                 )
             if order["order_status"] in {"fulfilled", "closed"}:
                 add(
-                    order["_booked_at"] + timedelta(days=2),
+                    max(shipment["_delivered_at"] for shipment in order_shipments),
                     "sales_order",
                     order["sales_order_id"],
                     "in_fulfillment",
@@ -508,10 +616,50 @@ class CausalCycleAssembler:
                 add(order["_closed_at"], "sales_order", order["sales_order_id"], "fulfilled", "closed")
 
         for shipment in shipments:
-            add(shipment["_delivered_at"], "shipment", shipment["shipment_id"], "shipped", "delivered")
+            add(
+                shipment["_shipped_at"],
+                "shipment",
+                shipment["shipment_id"],
+                "packed",
+                "shipped",
+            )
+            add(
+                shipment["_delivered_at"],
+                "shipment",
+                shipment["shipment_id"],
+                "shipped",
+                "delivered",
+            )
 
         for invoice in invoices:
-            add(invoice["_issued_at"], "invoice", invoice["invoice_id"], "draft", invoice["invoice_status"])
+            add(
+                invoice["_issued_at"],
+                "invoice",
+                invoice["invoice_id"],
+                "draft",
+                "open",
+            )
+            settled_status = invoice.get("_settled_status")
+            if settled_status:
+                add(
+                    invoice["_settled_at"],
+                    "invoice",
+                    invoice["invoice_id"],
+                    "open",
+                    settled_status,
+                )
+            if invoice["invoice_status"] == "disputed":
+                dispute = next(
+                    row for row in disputes if row["invoice_id"] == invoice["invoice_id"]
+                )
+                previous_status = settled_status or "open"
+                add(
+                    dispute["_opened_at"],
+                    "invoice",
+                    invoice["invoice_id"],
+                    previous_status,
+                    "disputed",
+                )
 
         for payment in payments:
             add(payment["_posted_at"], "payment", payment["payment_id"], "received", payment["payment_status"])
@@ -520,35 +668,8 @@ class CausalCycleAssembler:
             add(dispute["_opened_at"], "dispute", dispute["dispute_id"], "none", dispute["dispute_status"])
 
         sketches.sort(key=lambda row: (row[0], row[1], row[2], row[4]))
-        quotas = {
-            "account": 800,
-            "quote": 7_000,
-            "sales_order": 3_500,
-            "shipment": 1_500,
-            "invoice": 1_400,
-            "payment": 600,
-            "dispute": 200,
-        }
-        if sum(quotas.values()) != VOLUME_PLAN.timeline_events:
-            raise RuntimeError("event quotas must sum to the timeline target")
-        chosen: list[tuple[datetime, str, str, str, str]] = []
-        leftover: list[tuple[datetime, str, str, str, str]] = []
-        used = {key: 0 for key in quotas}
-        for sketch in sketches:
-            kind = sketch[1]
-            if used.get(kind, 0) < quotas.get(kind, 0):
-                chosen.append(sketch)
-                used[kind] += 1
-            else:
-                leftover.append(sketch)
-        if len(chosen) < VOLUME_PLAN.timeline_events:
-            need = VOLUME_PLAN.timeline_events - len(chosen)
-            if len(leftover) < need:
-                raise RuntimeError("timeline pool is smaller than the required event volume")
-            chosen.extend(leftover[:need])
-        chosen.sort(key=lambda row: (row[0], row[1], row[2], row[4]))
         events = []
-        for ts, entity_type, entity_id, prior, current in chosen:
+        for ts, entity_type, entity_id, prior, current in sketches:
             events.append(
                 {
                     "event_id": self.desk.next_id(PREFIX_EVENT),
