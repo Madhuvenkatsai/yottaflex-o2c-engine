@@ -197,6 +197,40 @@ class LedgerAuditor:
         invoices["_net"] = invoices["invoice_amount"].map(cents_from_text) + invoices["tax_amount"].map(cents_from_text)
         formula_ok = (invoices["_total"] == invoices["_net"]).all()
         report.add("balance:invoice_total_equals_net", bool(formula_ok), "total_due = invoice_amount + tax_amount")
+        # Validate invoice amounts against fulfilled amounts per order.
+        shipments = self.tables["shipments"].copy()
+        shipments["_fulfilled"] = shipments["fulfilled_amount"].map(cents_from_text)
+        fulfilled_by_order = shipments.groupby("sales_order_id")["_fulfilled"].sum()
+
+        invoices["_amount"] = invoices["invoice_amount"].map(cents_from_text)
+        billed_by_order = invoices.groupby("sales_order_id")["_amount"].sum()
+        comparable_orders = billed_by_order.index.intersection(fulfilled_by_order.index)
+        billed_comparable = billed_by_order.loc[comparable_orders]
+        fulfilled_comparable = fulfilled_by_order.loc[comparable_orders]
+        overbilled_orders = set(
+            billed_comparable.index[billed_comparable > fulfilled_comparable]
+        )
+
+        truth = self.tables["ground_truth"]
+        expected_faults = truth[
+            truth["anomaly_code"] == "invoice_exceeds_fulfillment"
+        ]
+        expected_invoice_ids = set(expected_faults["anchor_id"])
+        expected_orders = set(
+            invoices.loc[
+                invoices["invoice_id"].isin(expected_invoice_ids),
+                "sales_order_id",
+            ]
+        )
+
+        report.add(
+            "business:invoice_exceeds_fulfillment",
+            len(expected_orders) == 1 and overbilled_orders == expected_orders,
+            f"detected_orders={len(overbilled_orders)} "
+            f"expected_orders={len(expected_orders)} "
+            f"matches_ground_truth={overbilled_orders == expected_orders}",
+        )
+
 
         alloc = self.tables["payment_allocations"].copy()
         alloc["_amt"] = alloc["allocated_amount"].map(cents_from_text)
