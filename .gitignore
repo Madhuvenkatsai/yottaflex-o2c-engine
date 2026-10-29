@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+output/
+*.log
+.DS_Store
+.env
+
+# Temporary files
+check_exports.py
+src/o2c_sim/*.bak
+src/o2c_sim/*.backup*
+output/
+__pycache__/
+.pytest_cache/

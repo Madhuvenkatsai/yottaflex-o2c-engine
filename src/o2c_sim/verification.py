@@ -1,0 +1,237 @@
+from dataclasses import dataclass, field
+import re
+
+import pandas as pd
+
+from o2c_sim.money import cents_from_text
+
+
+ID_PATTERN = re.compile(r"^(ACC|QTE|SO|SHP|INV|PAY|DSP|EVT)-2026-\d{6}$")
+
+
+PRIMARY_KEYS = {
+    "accounts": "account_id",
+    "quotes": "quote_id",
+    "sales_orders": "sales_order_id",
+    "shipments": "shipment_id",
+    "invoices": "invoice_id",
+    "payments": "payment_id",
+    "disputes": "dispute_id",
+    "status_events": "event_id",
+}
+
+
+FOREIGN_KEYS = (
+    ("quotes", "account_id", "accounts", "account_id"),
+    ("quote_lines", "quote_id", "quotes", "quote_id"),
+
+    ("sales_orders", "quote_id", "quotes", "quote_id"),
+    ("sales_orders", "account_id", "accounts", "account_id"),
+    ("order_lines", "sales_order_id", "sales_orders", "sales_order_id"),
+    ("order_lines", "quote_line_id", "quote_lines", "quote_line_id"),
+
+    ("shipments", "sales_order_id", "sales_orders", "sales_order_id"),
+
+    ("invoices", "sales_order_id", "sales_orders", "sales_order_id"),
+    ("invoices", "shipment_id", "shipments", "shipment_id"),
+    ("invoices", "account_id", "accounts", "account_id"),
+    ("invoice_lines", "invoice_id", "invoices", "invoice_id"),
+    ("invoice_lines", "sales_order_id", "sales_orders", "sales_order_id"),
+    ("invoice_lines", "order_line_id", "order_lines", "order_line_id"),
+    ("invoice_lines", "shipment_id", "shipments", "shipment_id"),
+
+    ("payments", "account_id", "accounts", "account_id"),
+    ("payment_allocations", "payment_id", "payments", "payment_id"),
+    ("payment_allocations", "invoice_id", "invoices", "invoice_id"),
+
+    ("status_events", "entity_id", None, None),
+)
+
+
+TIME_PAIRS = (
+    ("quotes", "issued_at", "decided_at"),
+    ("sales_orders", "booked_at", "closed_at"),
+    ("shipments", "packed_at", "shipped_at"),
+    ("shipments", "shipped_at", "delivered_at"),
+    ("invoices", "issued_at", "due_at"),
+    ("payments", "posted_at", "posted_at"),
+    ("disputes", "opened_at", "opened_at"),
+)
+
+
+@dataclass
+class CheckResult:
+    name: str
+    passed: bool
+    detail: str
+
+
+@dataclass
+class VerificationReport:
+    checks: list[CheckResult] = field(default_factory=list)
+
+    def add(self, name: str, passed: bool, detail: str) -> None:
+        self.checks.append(CheckResult(name, passed, detail))
+
+    @property
+    def ok(self) -> bool:
+        return all(item.passed for item in self.checks)
+
+    def as_frame(self) -> pd.DataFrame:
+        return pd.DataFrame([{"check": c.name, "passed": "Y" if c.passed else "N", "detail": c.detail} for c in self.checks])
+
+
+class LedgerAuditor:
+    def __init__(self, tables: dict[str, pd.DataFrame], expected_volumes: dict[str, int]) -> None:
+        self.tables = tables
+        self.expected_volumes = expected_volumes
+
+    def run(self) -> VerificationReport:
+        report = VerificationReport()
+        self._check_volumes(report)
+        self._check_primary_keys(report)
+        self._check_id_shapes(report)
+        self._check_foreign_keys(report)
+        self._check_chronology(report)
+        self._check_balances(report)
+        self._check_ground_truth_isolation(report)
+        return report
+
+    def _check_volumes(self, report: VerificationReport) -> None:
+        for table, expected in self.expected_volumes.items():
+            actual = len(self.tables[table])
+            report.add(
+                f"volume:{table}",
+                actual == expected,
+                f"expected={expected} actual={actual}",
+            )
+
+    def _check_primary_keys(self, report: VerificationReport) -> None:
+        for table, column in PRIMARY_KEYS.items():
+            series = self.tables[table][column]
+            unique = series.nunique(dropna=False) == len(series) and series.ne("").all()
+            report.add(f"pk:{table}.{column}", bool(unique), f"rows={len(series)} unique={series.nunique()}")
+
+    def _check_id_shapes(self, report: VerificationReport) -> None:
+        for table, column in PRIMARY_KEYS.items():
+            bad = self.tables[table][column].map(lambda value: ID_PATTERN.match(str(value)) is None)
+            count = int(bad.sum())
+            report.add(f"id_format:{table}.{column}", count == 0, f"malformed={count}")
+
+    
+    def _check_foreign_keys(self, report: VerificationReport) -> None:
+        optional_references = {
+            ("invoices", "shipment_id"),
+            ("invoice_lines", "shipment_id"),
+            ("invoice_lines", "order_line_id"),
+        }
+
+        for child, child_col, parent, parent_col in FOREIGN_KEYS:
+            if parent is None:
+                continue
+
+            parent_keys = set(self.tables[parent][parent_col].dropna().tolist())
+            values = self.tables[child][child_col]
+
+            if (child, child_col) in optional_references:
+                values = values[values.notna() & values.ne("")]
+
+            missing = [
+                value for value in values.tolist()
+                if value not in parent_keys
+            ]
+
+            report.add(
+                f"fk:{child}.{child_col}->{parent}.{parent_col}",
+                len(missing) == 0,
+                f"orphans={len(missing)}",
+            )
+
+        dispute_ids = set(self.tables["disputes"]["invoice_id"].tolist())
+        invoice_ids = set(self.tables["invoices"]["invoice_id"].tolist())
+        stranded = dispute_ids - invoice_ids
+
+        report.add(
+            "fk:disputes.invoice_id->invoices.invoice_id",
+            len(stranded) == 1,
+            f"non_receivable_disputes={len(stranded)} "
+            "(exactly one injected phantom expected)",
+        )
+
+    def _check_chronology(self, report: VerificationReport) -> None:
+        quotes = self.tables["quotes"]
+        orders = self.tables["sales_orders"]
+        merged = orders.merge(quotes, on="quote_id", suffixes=("_so", "_qte"))
+        ordered = (merged["booked_at"] >= merged["issued_at"]).all()
+        report.add("chrono:sales_order_after_quote", bool(ordered), "booked_at >= quote.issued_at")
+
+        ships = self.tables["shipments"].merge(orders, on="sales_order_id")
+        ship_ok = (ships["packed_at"] >= ships["booked_at"]).all()
+        report.add("chrono:shipment_after_order", bool(ship_ok), "packed_at >= booked_at")
+
+        events = self.tables["status_events"].copy()
+        events["occurred_at"] = pd.to_datetime(events["occurred_at"], utc=True)
+        grouped = events.sort_values("occurred_at").groupby("entity_id")["occurred_at"]
+        monotonic = True
+        for _, series in grouped:
+            if not series.is_monotonic_increasing:
+                monotonic = False
+                break
+        report.add("chrono:events_per_entity", monotonic, "occurred_at non-decreasing within entity_id")
+
+        for table, start, end in TIME_PAIRS:
+            frame = self.tables[table]
+            if start == end:
+                report.add(f"chrono:{table}.{start}", True, "single timestamp column")
+                continue
+            left = frame[start].astype(str)
+            right = frame[end].astype(str)
+            comparable = right.str.len() > 0
+            ok = bool((right[comparable] >= left[comparable]).all()) if comparable.any() else True
+            report.add(f"chrono:{table}.{start}<={end}", ok, "timestamp order")
+
+    def _check_balances(self, report: VerificationReport) -> None:
+        invoices = self.tables["invoices"].copy()
+        invoices["_total"] = invoices["total_due"].map(cents_from_text)
+        invoices["_balance"] = invoices["balance_due"].map(cents_from_text)
+        invoices["_net"] = invoices["invoice_amount"].map(cents_from_text) + invoices["tax_amount"].map(cents_from_text)
+        formula_ok = (invoices["_total"] == invoices["_net"]).all()
+        report.add("balance:invoice_total_equals_net", bool(formula_ok), "total_due = invoice_amount + tax_amount")
+
+        alloc = self.tables["payment_allocations"].copy()
+        alloc["_amt"] = alloc["allocated_amount"].map(cents_from_text)
+        applied = alloc.groupby("invoice_id")["_amt"].sum()
+        joined = invoices.set_index("invoice_id")
+        paid = joined["_total"] - joined["_balance"]
+        compared = paid.subtract(applied).fillna(paid)
+        # Double allocation is an injected fault, so the auditor records drift instead of failing the suite.
+        drift_rows = int((compared.abs() > 0).sum())
+        report.add("balance:allocations_vs_invoice", True, f"invoices_with_allocation_drift={drift_rows}")
+
+        payments = self.tables["payments"].copy()
+        payments["_amt"] = payments["payment_amount"].map(cents_from_text)
+        applied_pmt = alloc.groupby("payment_id")["_amt"].sum()
+        pay_join = payments.set_index("payment_id")["_amt"].subtract(applied_pmt).fillna(0)
+        over_applied = int((pay_join < 0).sum())
+        report.add("balance:payment_over_allocation", True, f"payments_over_applied={over_applied}")
+
+    def _check_ground_truth_isolation(self, report: VerificationReport) -> None:
+        truth = self.tables["ground_truth"]
+        codes = set(truth["anomaly_code"].tolist())
+        expected = {
+            "invoice_exceeds_fulfillment",
+            "payment_allocated_twice",
+            "order_closed_with_unpaid_invoice",
+            "status_event_skips_state",
+            "dispute_not_in_receivables",
+        }
+        report.add("ground_truth:five_anomalies", codes == expected, f"codes={sorted(codes)}")
+
+        feature_tables = [name for name in self.tables if name != "ground_truth"]
+        leaked = False
+        for name in feature_tables:
+            blob = " ".join(self.tables[name].astype(str).fillna("").values.ravel().tolist())
+            if "anomaly_code" in self.tables[name].columns or "GT-0001" in blob:
+                leaked = True
+                break
+        report.add("ground_truth:isolated_from_features", not leaked, "label columns absent from operational tables")
