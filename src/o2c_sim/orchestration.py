@@ -10,8 +10,8 @@ from o2c_sim.entropy import StreamedEntropy
 from o2c_sim.fault_injection import KnownFaultInjector, ground_truth_frame
 from o2c_sim.identity import SequenceDesk
 from o2c_sim.ledger import OperationalLedger
-from o2c_sim.settings import CHALLENGE_SEED, VOLUME_PLAN
-from o2c_sim.verification import LedgerAuditor
+from o2c_sim.settings import CHALLENGE_SEED, volume_plan_for_scale
+from o2c_sim.verification import ANOMALY_CODES, LedgerAuditor
 
 
 PRIMARY_KEYS = {
@@ -104,8 +104,10 @@ def sqlite_value(value):
 
 
 class O2CPipelineSimulator:
-    def __init__(self, seed: int = CHALLENGE_SEED) -> None:
+    def __init__(self, seed: int = CHALLENGE_SEED, scale: str = "full") -> None:
         self.seed = seed
+        self.scale = scale
+        self.volume_plan = volume_plan_for_scale(scale)
         self.ledger = OperationalLedger()
         self.last_report = None
 
@@ -116,6 +118,7 @@ class O2CPipelineSimulator:
         records = CausalCycleAssembler(
             entropy,
             desk,
+            self.volume_plan,
         ).assemble_initial_records()
 
         truth_rows = KnownFaultInjector(desk).apply(records)
@@ -138,22 +141,22 @@ class O2CPipelineSimulator:
 
         # Run data-quality verification.
         expected = {
-            "accounts": VOLUME_PLAN.accounts,
-            "quotes": VOLUME_PLAN.quotes,
-            "quote_lines": VOLUME_PLAN.quotes,
-            "sales_orders": VOLUME_PLAN.sales_orders,
-            "order_lines": VOLUME_PLAN.sales_orders,
-            "invoices": VOLUME_PLAN.invoices,
-            "invoice_lines": VOLUME_PLAN.invoices,
-            "payments": VOLUME_PLAN.payments,
-            "disputes": VOLUME_PLAN.disputes,
-            "status_events": VOLUME_PLAN.timeline_events,
-            "ground_truth": 5,
+            "accounts": self.volume_plan.accounts,
+            "quotes": self.volume_plan.quotes,
+            "quote_lines": self.volume_plan.quotes,
+            "sales_orders": self.volume_plan.sales_orders,
+            "order_lines": self.volume_plan.sales_orders,
+            "invoices": self.volume_plan.invoices,
+            "invoice_lines": self.volume_plan.invoices,
+            "payments": self.volume_plan.payments,
+            "disputes": self.volume_plan.disputes,
+            "ground_truth": len(ANOMALY_CODES),
         }
 
         report = LedgerAuditor(
             self.ledger.tables,
             expected,
+            self.volume_plan,
         ).run()
 
         self.last_report = report

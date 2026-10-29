@@ -1,14 +1,15 @@
 from pathlib import Path
 
 import pytest
+import pandas as pd
 
 from o2c_sim.cycle_builder import CausalCycleAssembler
 from o2c_sim.entropy import StreamedEntropy
 from o2c_sim.identity import SequenceDesk
 from o2c_sim.money import cents_from_text
 from o2c_sim.orchestration import O2CPipelineSimulator
-from o2c_sim.settings import VOLUME_PLAN
-from o2c_sim.verification import CheckResult, LedgerAuditor
+from o2c_sim.settings import STARTER_VOLUME_PLAN, VOLUME_PLAN
+from o2c_sim.verification import ANOMALY_CODES, CheckResult, LedgerAuditor
 
 
 EXPECTED_COUNTS = {
@@ -23,8 +24,7 @@ EXPECTED_COUNTS = {
     "payments": 6_934,
     "payment_allocations": 6_935,
     "disputes": 420,
-    "status_events": 15_000,
-    "ground_truth": 5,
+    "ground_truth": len(ANOMALY_CODES),
 }
 
 EXPECTED_VOLUMES = {
@@ -36,8 +36,7 @@ EXPECTED_VOLUMES = {
     "invoices": VOLUME_PLAN.invoices,
     "invoice_lines": VOLUME_PLAN.invoices,
     "disputes": VOLUME_PLAN.disputes,
-    "status_events": VOLUME_PLAN.timeline_events,
-    "ground_truth": 5,
+    "ground_truth": len(ANOMALY_CODES),
 }
 
 
@@ -46,8 +45,8 @@ def generated_tables():
     return O2CPipelineSimulator().run().tables
 
 
-def audit(tables):
-    return LedgerAuditor(tables, EXPECTED_VOLUMES).run()
+def audit(tables, volume_plan=VOLUME_PLAN):
+    return LedgerAuditor(tables, EXPECTED_VOLUMES, volume_plan).run()
 
 
 def copy_tables(tables):
@@ -58,7 +57,7 @@ def by_name(report):
     return {check.name: check for check in report.checks}
 
 
-def test_all_five_anomalies_are_detected_and_evaluated(generated_tables):
+def test_required_and_coverage_anomalies_are_detected_and_evaluated(generated_tables):
     report = audit(generated_tables)
     checks = by_name(report)
 
@@ -69,6 +68,8 @@ def test_all_five_anomalies_are_detected_and_evaluated(generated_tables):
         "order_closed_with_unpaid_invoice",
         "status_event_skips_state",
         "dispute_not_in_receivables",
+        "underbilling",
+        "duplicate_invoice",
     ):
         assert checks[f"anomaly_detected:{code}"].passed
         assert checks[f"evaluation:{code}_matches_ground_truth"].passed
@@ -82,6 +83,25 @@ def test_all_five_anomalies_are_detected_and_evaluated(generated_tables):
     skipped_order = truth.at["status_event_skips_state", "related_ids"]
     assert invoice_order != closed_order
     assert skipped_order not in {invoice_order, closed_order}
+    assert len(truth) == len(ANOMALY_CODES)
+
+    shipments_by_order = generated_tables["shipments"].groupby("sales_order_id").size()
+    assert (shipments_by_order > 1).any()
+    assert checks["financial:short_paid_invoices"].passed
+    assert checks["financial:aging_at_fixed_cutoff"].passed
+    assert "over_90_days" in checks["financial:aging_at_fixed_cutoff"].detail
+
+    skipped_event_id = truth.at["status_event_skips_state", "anchor_id"]
+    skipped_event = generated_tables["status_events"].set_index("event_id").loc[
+        skipped_event_id
+    ]
+    assert skipped_event["from_status"] == "booked"
+    assert skipped_event["to_status"] == "closed"
+    assert (
+        generated_tables["status_events"]["entity_id"]
+        .eq(skipped_event["entity_id"])
+        .any()
+    )
 
 
 def test_detectors_do_not_use_ground_truth_as_input(generated_tables):
@@ -95,6 +115,8 @@ def test_detectors_do_not_use_ground_truth_as_input(generated_tables):
         "order_closed_with_unpaid_invoice",
         "status_event_skips_state",
         "dispute_not_in_receivables",
+        "underbilling",
+        "duplicate_invoice",
     ):
         assert checks[f"anomaly_detected:{code}"].passed
         assert not checks[f"evaluation:{code}_matches_ground_truth"].passed
@@ -132,6 +154,140 @@ def test_lifecycle_transitions_and_timestamp_order_are_checked(generated_tables)
     assert not checks["chrono:shipments.shipped_at<=delivered_at"].passed
     assert not checks["chrono:invoice_after_shipment"].passed
     assert not checks["chrono:quote_after_account_open"].passed
+
+
+def test_all_stateful_entities_have_complete_event_history(generated_tables):
+    checks = by_name(audit(generated_tables))
+    assert checks["lifecycle:event_history_complete"].passed
+    assert len(generated_tables["status_events"]) > VOLUME_PLAN.timeline_events
+    assert (
+        len(generated_tables["status_events"])
+        + len(generated_tables["payments"])
+        >= VOLUME_PLAN.timeline_events
+    )
+
+
+def test_quantity_reconciliation_handles_split_shipments_and_invoices(generated_tables):
+    checks = by_name(audit(generated_tables))
+    assert checks["quantity:fulfillment_to_invoice_reconciliation"].passed
+    assert checks["quantity:shipment_not_exceed_ordered"].passed
+    assert checks["quantity:ordinary_invoice_quantity_not_exceed_fulfilled"].passed
+    assert checks["financial:invoice_line_quantity_times_unit_price"].passed
+    assert checks["financial:shipment_quantity_times_order_unit_price"].passed
+    assert checks[
+        "relationship:order_line_quantity_price_matches_quote_line"
+    ].passed
+
+    shipment_counts = generated_tables["shipments"].groupby("sales_order_id").size()
+    invoice_counts = generated_tables["invoices"].groupby("sales_order_id").size()
+    assert (shipment_counts > 1).any()
+    assert (invoice_counts > 1).any()
+
+
+def test_quantity_overbilling_is_detected_without_ground_truth(generated_tables):
+    tables = copy_tables(generated_tables)
+    shipment_qty = tables["shipments"].groupby("sales_order_id")[
+        "fulfilled_quantity"
+    ].sum()
+    invoice_qty = tables["invoice_lines"].merge(
+        tables["invoices"][["invoice_id", "sales_order_id"]],
+        on="invoice_id",
+        suffixes=("", "_invoice"),
+    ).groupby("sales_order_id")["quantity"].sum()
+    invoice_counts = tables["invoices"].groupby("sales_order_id").size()
+    orders = tables["sales_orders"].set_index("sales_order_id")
+    candidate = next(
+        row
+        for _, row in tables["invoices"].loc[
+            tables["invoices"]["invoice_status"] == "open"
+        ].iterrows()
+        if row["sales_order_id"] in shipment_qty.index
+        and shipment_qty[row["sales_order_id"]]
+        == invoice_qty.get(row["sales_order_id"], 0)
+        and invoice_counts.get(row["sales_order_id"], 0) == 1
+        and orders.at[row["sales_order_id"], "order_status"] != "closed"
+    )
+    invoice_id = candidate["invoice_id"]
+    line_index = tables["invoice_lines"].index[
+        tables["invoice_lines"]["invoice_id"] == invoice_id
+    ][0]
+    unit_price_cents = cents_from_text(
+        tables["invoice_lines"].at[line_index, "unit_price"]
+    )
+    new_amount = cents_from_text(candidate["invoice_amount"]) + unit_price_cents
+    account_region = tables["accounts"].set_index("account_id").at[
+        candidate["account_id"], "region"
+    ]
+    tax = 0 if account_region.startswith("NA") else int(round(new_amount * 0.08))
+    total = new_amount + tax
+    tables["invoice_lines"].at[line_index, "quantity"] += 1
+    tables["invoice_lines"].at[line_index, "line_amount"] = (
+        f"{new_amount / 100:.2f}"
+    )
+    invoice_index = tables["invoices"].index[
+        tables["invoices"]["invoice_id"] == invoice_id
+    ][0]
+    tables["invoices"].at[invoice_index, "invoice_amount"] = f"{new_amount / 100:.2f}"
+    tables["invoices"].at[invoice_index, "tax_amount"] = f"{tax / 100:.2f}"
+    tables["invoices"].at[invoice_index, "total_due"] = f"{total / 100:.2f}"
+    tables["invoices"].at[invoice_index, "balance_due"] = f"{total / 100:.2f}"
+    tables["ground_truth"]["anchor_id"] = "not-a-real-entity"
+
+    checks = by_name(audit(tables))
+    assert invoice_id in checks[
+        "anomaly_detected:invoice_exceeds_fulfillment"
+    ].detail
+    assert not checks["quantity:fulfillment_to_invoice_reconciliation"].passed
+    assert checks["financial:invoice_line_quantity_times_unit_price"].passed
+
+
+def test_order_and_shipment_quantities_reconcile_to_source_lines(generated_tables):
+    tables = copy_tables(generated_tables)
+    tables["order_lines"].at[0, "quantity"] += 1
+
+    checks = by_name(audit(tables))
+    assert not checks[
+        "relationship:order_line_quantity_price_matches_quote_line"
+    ].passed
+    assert not checks["financial:order_lines_quantity_times_unit_price"].passed
+
+    tables = copy_tables(generated_tables)
+    tables["shipments"].at[0, "fulfilled_amount"] = "0.01"
+    checks = by_name(audit(tables))
+    assert not checks[
+        "financial:shipment_quantity_times_order_unit_price"
+    ].passed
+
+
+def test_starter_scale_has_expected_volumes_and_detects_required_anomalies():
+    from o2c_sim.settings import STARTER_VOLUME_PLAN
+
+    tables = O2CPipelineSimulator(scale="starter").run().tables
+    expected = {
+        "accounts": STARTER_VOLUME_PLAN.accounts,
+        "quotes": STARTER_VOLUME_PLAN.quotes,
+        "quote_lines": STARTER_VOLUME_PLAN.quotes,
+        "sales_orders": STARTER_VOLUME_PLAN.sales_orders,
+        "order_lines": STARTER_VOLUME_PLAN.sales_orders,
+        "shipments": 753,
+        "invoices": STARTER_VOLUME_PLAN.invoices,
+        "invoice_lines": STARTER_VOLUME_PLAN.invoices,
+        "payments": STARTER_VOLUME_PLAN.payments,
+        "payment_allocations": STARTER_VOLUME_PLAN.payments + 1,
+        "disputes": STARTER_VOLUME_PLAN.disputes,
+        "status_events": 8_419,
+        "ground_truth": len(ANOMALY_CODES),
+    }
+    report = LedgerAuditor(tables, expected, STARTER_VOLUME_PLAN).run()
+    assert report.ok, [check for check in report.checks if not check.passed]
+    checks = by_name(report)
+    for code in ANOMALY_CODES:
+        assert checks[f"anomaly_detected:{code}"].passed
+        assert checks[f"evaluation:{code}_matches_ground_truth"].passed
+    assert (
+        len(tables["payments"]) + len(tables["status_events"])
+        >= STARTER_VOLUME_PLAN.timeline_events
+    )
 
 
 def test_financial_reconciliation_detects_unexpected_balance_drift(generated_tables):
@@ -190,10 +346,31 @@ def test_invoice_tax_and_totals_are_independently_validated(generated_tables):
     assert not checks["financial:invoice_tax_rate"].passed
 
 
+def test_underbilling_duplicate_invoice_and_aging_are_reported(generated_tables):
+    checks = by_name(audit(generated_tables))
+    assert checks["anomaly_detected:underbilling"].passed
+    assert checks["anomaly_detected:duplicate_invoice"].passed
+    assert checks["financial:fulfillment_to_invoice_reconciliation"].passed
+    assert checks["financial:aging_at_fixed_cutoff"].passed
+
+    tables = copy_tables(generated_tables)
+    tables["invoices"]["due_at"] = "2026-10-22T18:00:00Z"
+    aged = by_name(audit(tables))["financial:aging_at_fixed_cutoff"]
+    assert not aged.passed
+    assert "over_90_days" in aged.detail
+
+
 def test_expected_volumes_and_insufficient_dispute_candidates(generated_tables):
-    assert {
+    actual_fixed_counts = {
         table: len(frame) for table, frame in generated_tables.items()
-    } == EXPECTED_COUNTS
+        if table in EXPECTED_COUNTS
+    }
+    assert actual_fixed_counts == EXPECTED_COUNTS
+    assert (
+        len(generated_tables["status_events"])
+        + len(generated_tables["payments"])
+        >= VOLUME_PLAN.timeline_events
+    )
 
     tables = copy_tables(generated_tables)
     tables["disputes"] = tables["disputes"].iloc[:-1].reset_index(drop=True)
@@ -213,6 +390,29 @@ def test_expected_volumes_and_insufficient_dispute_candidates(generated_tables):
                 for _ in range(VOLUME_PLAN.payments - 1)
             ]
         )
+    starter_assembler = CausalCycleAssembler(
+        StreamedEntropy(1), SequenceDesk(), STARTER_VOLUME_PLAN
+    )
+    with pytest.raises(RuntimeError, match="insufficient eligible invoices"):
+        starter_assembler._build_disputes(
+            [{"invoice_status": "open"} for _ in range(STARTER_VOLUME_PLAN.disputes - 1)]
+        )
+    with pytest.raises(RuntimeError, match="insufficient eligible invoices for payment target"):
+        starter_assembler._build_settlements(
+            [
+                {"_order_ref": {"order_status": "fulfilled"}}
+                for _ in range(STARTER_VOLUME_PLAN.payments - 1)
+            ]
+        )
+    with pytest.raises(RuntimeError, match="invoice target cannot be met"):
+        starter_assembler._build_invoices([], [])
+
+    from o2c_sim.fault_injection import KnownFaultInjector
+
+    with pytest.raises(RuntimeError, match="no invoice available for fulfillment overrun"):
+        KnownFaultInjector(SequenceDesk())._invoice_beyond_shipped(
+            {"invoices": [], "shipments": []}, []
+        )
 
 
 def test_report_includes_expected_and_observed_evidence(generated_tables):
@@ -224,13 +424,19 @@ def test_report_includes_expected_and_observed_evidence(generated_tables):
     assert "detected_ids=" in checks[
         "anomaly_detected:payment_allocated_twice"
     ].detail
+    reconciliation = checks[
+        "financial:fulfillment_to_invoice_reconciliation"
+    ].detail
+    assert "expected_deltas_cents=" in reconciliation
+    assert "observed_deltas_cents=" in reconciliation
+    assert "unexpected_orders=[]" in reconciliation
 
 
 def test_cli_returns_nonzero_when_verification_fails(monkeypatch, tmp_path: Path, capsys):
     from o2c_sim import cli
 
     class FailedSimulator:
-        def __init__(self, seed):
+        def __init__(self, seed, scale):
             self.last_report = None
             self.ledger = type("Ledger", (), {"row_census": lambda self: {"accounts": 1}})()
 
@@ -253,7 +459,9 @@ def test_cli_returns_zero_when_verification_passes(monkeypatch, tmp_path: Path, 
     from o2c_sim import cli
 
     class SuccessfulSimulator:
-        def __init__(self, seed):
+        def __init__(self, seed, scale):
+            assert seed == 20261022
+            assert scale == "starter"
             self.last_report = None
             self.ledger = type("Ledger", (), {"row_census": lambda self: {"accounts": 1}})()
 
@@ -265,8 +473,10 @@ def test_cli_returns_zero_when_verification_passes(monkeypatch, tmp_path: Path, 
             )()
 
     monkeypatch.setattr(cli, "O2CPipelineSimulator", SuccessfulSimulator)
-    assert cli.main([str(tmp_path)]) == 0
-    assert "verification_failed=0" in capsys.readouterr().out
+    assert cli.main(["--scale", "starter", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "scale=starter" in output
+    assert "verification_failed=0" in output
 
 
 def test_csv_jsonl_sqlite_and_sql_exports(generated_tables, tmp_path: Path):
@@ -278,19 +488,45 @@ def test_csv_jsonl_sqlite_and_sql_exports(generated_tables, tmp_path: Path):
     simulator.persist(tmp_path)
 
     assert simulator.last_report is not None and simulator.last_report.ok
-    for table, count in EXPECTED_COUNTS.items():
+    for table, frame in generated_tables.items():
+        count = len(frame)
         jsonl = tmp_path / "json" / f"{table}.json"
         rows = [json.loads(line) for line in jsonl.read_text(encoding="utf-8").splitlines()]
         assert len(rows) == count
         assert set(rows[0]) == set(generated_tables[table].columns)
+        csv_rows = pd.read_csv(
+            tmp_path / f"{table}.csv", dtype=str, keep_default_na=False
+        ).to_dict("records")
+        json_rows = [
+            {key: "" if value is None else str(value) for key, value in row.items()}
+            for row in rows
+        ]
+        assert json_rows == csv_rows
 
     database = tmp_path / "o2c_ledger.sqlite"
     assert database.is_file()
     with sqlite3.connect(database) as connection:
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
-        for table, count in EXPECTED_COUNTS.items():
+        for table, frame in generated_tables.items():
+            count = len(frame)
             observed = connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
             assert observed == count
+            sqlite_rows = connection.execute(
+                f'SELECT * FROM "{table}"'
+            ).fetchall()
+            normalized = [
+                ["" if value is None else str(value) for value in row]
+                for row in sqlite_rows
+            ]
+            assert normalized == [
+                ["" if pd.isna(value) else str(value) for value in row]
+                for row in frame.itertuples(index=False, name=None)
+            ]
     sql_dump = (tmp_path / "o2c_ledger.sql").read_text(encoding="utf-8")
     assert 'CREATE TABLE "accounts"' in sql_dump
     assert 'CREATE TABLE "ground_truth"' in sql_dump
+    restored = tmp_path / "restored.sqlite"
+    with sqlite3.connect(restored) as connection:
+        connection.executescript(sql_dump)
+        for table, frame in generated_tables.items():
+            assert connection.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0] == len(frame)
